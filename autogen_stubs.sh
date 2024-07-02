@@ -4,12 +4,15 @@
 if [[ ! $(clang2py -V) ]]; then
   pushd .
   cd /tmp
+  sudo apt-get update
   sudo apt-get install -y --no-install-recommends clang
-  pip install --upgrade pip setuptools
-  pip install clang==14.0.6
-  git clone https://github.com/geohot/ctypeslib.git
+  CLANG_VERSION=$(clang -v 2>&1 | grep -oP 'clang version \K\d+')
+  if [ ! -d "ctypeslib" ]; then
+    git clone https://github.com/andiradulescu/ctypeslib.git
+  fi
   cd ctypeslib
-  pip install --user .
+  pip install --upgrade pip setuptools
+  pip install clang==$CLANG_VERSION.* .
   clang2py -V
   popd
 fi
