@@ -1,6 +1,7 @@
+# mypy: ignore-errors
 # -*- coding: utf-8 -*-
 #
-# TARGET arch is: []
+# TARGET arch is: ['-I/lib/modules/4.9.103+/build/include/']
 # WORD_SIZE is: 8
 # POINTER_SIZE is: 8
 # LONGDOUBLE_SIZE is: 16
@@ -217,6 +218,24 @@ struct_kgsl_shadowprop._fields_ = [
     ('size', ctypes.c_uint64),
     ('flags', ctypes.c_uint32),
     ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+class struct_kgsl_qdss_stm_prop(Structure):
+    pass
+
+struct_kgsl_qdss_stm_prop._pack_ = 1 # source:False
+struct_kgsl_qdss_stm_prop._fields_ = [
+    ('gpuaddr', ctypes.c_uint64),
+    ('size', ctypes.c_uint64),
+]
+
+class struct_kgsl_qtimer_prop(Structure):
+    pass
+
+struct_kgsl_qtimer_prop._pack_ = 1 # source:False
+struct_kgsl_qtimer_prop._fields_ = [
+    ('gpuaddr', ctypes.c_uint64),
+    ('size', ctypes.c_uint64),
 ]
 
 class struct_kgsl_version(Structure):
@@ -970,6 +989,90 @@ struct_kgsl_gpuobj_set_info._fields_ = [
     ('PADDING_0', ctypes.c_ubyte * 4),
 ]
 
+class struct_kgsl_sparse_phys_alloc(Structure):
+    pass
+
+struct_kgsl_sparse_phys_alloc._pack_ = 1 # source:False
+struct_kgsl_sparse_phys_alloc._fields_ = [
+    ('size', ctypes.c_uint64),
+    ('pagesize', ctypes.c_uint64),
+    ('flags', ctypes.c_uint64),
+    ('id', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+class struct_kgsl_sparse_phys_free(Structure):
+    pass
+
+struct_kgsl_sparse_phys_free._pack_ = 1 # source:False
+struct_kgsl_sparse_phys_free._fields_ = [
+    ('id', ctypes.c_uint32),
+]
+
+class struct_kgsl_sparse_virt_alloc(Structure):
+    pass
+
+struct_kgsl_sparse_virt_alloc._pack_ = 1 # source:False
+struct_kgsl_sparse_virt_alloc._fields_ = [
+    ('size', ctypes.c_uint64),
+    ('pagesize', ctypes.c_uint64),
+    ('flags', ctypes.c_uint64),
+    ('gpuaddr', ctypes.c_uint64),
+    ('id', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+class struct_kgsl_sparse_virt_free(Structure):
+    pass
+
+struct_kgsl_sparse_virt_free._pack_ = 1 # source:False
+struct_kgsl_sparse_virt_free._fields_ = [
+    ('id', ctypes.c_uint32),
+]
+
+class struct_kgsl_sparse_binding_object(Structure):
+    pass
+
+struct_kgsl_sparse_binding_object._pack_ = 1 # source:False
+struct_kgsl_sparse_binding_object._fields_ = [
+    ('virtoffset', ctypes.c_uint64),
+    ('physoffset', ctypes.c_uint64),
+    ('size', ctypes.c_uint64),
+    ('flags', ctypes.c_uint64),
+    ('id', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+class struct_kgsl_sparse_bind(Structure):
+    pass
+
+struct_kgsl_sparse_bind._pack_ = 1 # source:False
+struct_kgsl_sparse_bind._fields_ = [
+    ('list', ctypes.c_uint64),
+    ('id', ctypes.c_uint32),
+    ('size', ctypes.c_uint32),
+    ('count', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+class struct_kgsl_gpu_sparse_command(Structure):
+    pass
+
+struct_kgsl_gpu_sparse_command._pack_ = 1 # source:False
+struct_kgsl_gpu_sparse_command._fields_ = [
+    ('flags', ctypes.c_uint64),
+    ('sparselist', ctypes.c_uint64),
+    ('synclist', ctypes.c_uint64),
+    ('sparsesize', ctypes.c_uint32),
+    ('numsparse', ctypes.c_uint32),
+    ('syncsize', ctypes.c_uint32),
+    ('numsyncs', ctypes.c_uint32),
+    ('context_id', ctypes.c_uint32),
+    ('timestamp', ctypes.c_uint32),
+    ('id', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
 __all__ = \
     ['KGSL_CMDWINDOW_2D', 'KGSL_CMDWINDOW_3D',
     'KGSL_CMDWINDOW_ARBITER', 'KGSL_CMDWINDOW_MAX',
@@ -1006,7 +1109,8 @@ __all__ = \
     'struct_kgsl_drawctxt_set_bin_base_offset',
     'struct_kgsl_gmem_desc', 'struct_kgsl_gpmu_version',
     'struct_kgsl_gpu_command', 'struct_kgsl_gpu_event_fence',
-    'struct_kgsl_gpu_event_timestamp', 'struct_kgsl_gpumem_alloc',
+    'struct_kgsl_gpu_event_timestamp',
+    'struct_kgsl_gpu_sparse_command', 'struct_kgsl_gpumem_alloc',
     'struct_kgsl_gpumem_alloc_id', 'struct_kgsl_gpumem_free_id',
     'struct_kgsl_gpumem_get_info', 'struct_kgsl_gpumem_sync_cache',
     'struct_kgsl_gpumem_sync_cache_bulk', 'struct_kgsl_gpuobj_alloc',
@@ -1020,11 +1124,15 @@ __all__ = \
     'struct_kgsl_perfcounter_read',
     'struct_kgsl_perfcounter_read_group',
     'struct_kgsl_preemption_counters_query',
+    'struct_kgsl_qdss_stm_prop', 'struct_kgsl_qtimer_prop',
     'struct_kgsl_ringbuffer_issueibcmds', 'struct_kgsl_shadowprop',
     'struct_kgsl_sharedmem_free', 'struct_kgsl_sharedmem_from_pmem',
     'struct_kgsl_sharedmem_from_vmalloc',
-    'struct_kgsl_sp_generic_mem', 'struct_kgsl_submit_commands',
-    'struct_kgsl_syncsource_create',
+    'struct_kgsl_sp_generic_mem', 'struct_kgsl_sparse_bind',
+    'struct_kgsl_sparse_binding_object',
+    'struct_kgsl_sparse_phys_alloc', 'struct_kgsl_sparse_phys_free',
+    'struct_kgsl_sparse_virt_alloc', 'struct_kgsl_sparse_virt_free',
+    'struct_kgsl_submit_commands', 'struct_kgsl_syncsource_create',
     'struct_kgsl_syncsource_create_fence',
     'struct_kgsl_syncsource_destroy',
     'struct_kgsl_syncsource_signal_fence',
