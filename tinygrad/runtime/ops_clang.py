@@ -7,7 +7,7 @@ from tinygrad.renderer.cstyle import ClangRenderer
 # Used by ops_dsp.py
 class ClangCompiler(Compiler):
   def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
-    self.args = ['-march=native'] if args is None else args
+    self.args = args if args is not None else ['-mcpu=native' if platform.machine().lower() in ('arm64', 'aarch64') else '-march=native']
     self.objdump_tool = objdump_tool
     super().__init__(cachekey)
 
