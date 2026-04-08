@@ -27,6 +27,9 @@ def _qreg_exec(__reg, __val=0, **kwargs):
 qreg: Any = type("QREG", (object,), {name[4:].lower(): functools.partial(_qreg_exec, name) for name in mesa.__dict__.keys() if name[:4] == 'REG_'})
 
 def _ctz(v): return (v & -v).bit_length() - 1
+def _trace_high_iova_threshold() -> int | None:
+  if (val := os.getenv("MSM_TRACE_HIGH_IOVA")) is None: return None
+  return 0x200000000 if val == "1" else int(val, 0)
 
 @dataclass
 class MSMBuffer:
@@ -45,7 +48,11 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET)
     cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
     info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA)
-    return MSMBuffer(handle=gem.handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
+    buf = MSMBuffer(handle=gem.handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
+    if (threshold := _trace_high_iova_threshold()) is not None and buf.iova >= threshold:
+      print(f"MSM_HIGH_ALLOC handle={buf.handle} size=0x{size:x} alloc=0x{alloc_size:x} iova=0x{buf.iova:016x} cpu_access={int(options.cpu_access)}",
+            flush=True)
+    return buf
 
   def _free(self, opaque: MSMBuffer, options: BufferSpec):
     # GEM_CLOSE unmaps IOVA from IOMMU but GPU TLB retains stale entries, causing translation faults.
@@ -187,7 +194,7 @@ class MSMProgram:
     self.fregs, self.hregs = v.info.max_reg + 1, v.info.max_half_reg + 1
 
     # allocate GEM BO for shader code
-    self.lib_buf: MSMBuffer = dev.allocator.alloc(self.image_size)
+    self.lib_buf: MSMBuffer = dev.allocator.alloc(self.image_size, BufferSpec(cpu_access=True))
     to_mv(self.lib_buf.cpu_addr, self.image_size)[:] = self.image
 
     # compute derived sizes
@@ -211,7 +218,7 @@ class MSMProgram:
     if self.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
 
     # allocate args buffer and fill it
-    args_buf: MSMBuffer = self.dev.allocator.alloc(self.kernargs_alloc_size)
+    args_buf: MSMBuffer = self.dev.allocator.alloc(self.kernargs_alloc_size, BufferSpec(cpu_access=True))
     ctypes.memset(args_buf.cpu_addr, 0, self.kernargs_alloc_size)
 
     ubos = [b for i, b in enumerate(bufs) for _, dt in self.buf_dtypes[i] if not isinstance(dt, ImageDType)]
@@ -240,10 +247,13 @@ class MSMProgram:
     def _tex(b, ibo=False):
       imgdt, buf = b
       fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
-      return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
+      return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
               qreg.a6xx_tex_const_1(width=imgdt.shape[1], height=imgdt.shape[0]),
-              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=imgdt.pitch, pitchalign=_ctz(imgdt.pitch) - 6), 0, *data64_le(buf.iova),
-              qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=imgdt.pitch, pitchalign=_ctz(imgdt.pitch) - 6),
+              0,
+              buf.iova & 0xFFFFFFFF,
+              (buf.iova >> 32) | qreg.a6xx_tex_const_5(depth=1),
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
     if texs:
       tex_data = array.array('I', flatten(map(_tex, texs)))
@@ -256,7 +266,7 @@ class MSMProgram:
     pm4 = _build_pm4(self, args_buf, global_size, local_size)
 
     # write PM4 into command buffer
-    cmd_buf: MSMBuffer = self.dev.allocator.alloc(len(pm4) * 4)
+    cmd_buf: MSMBuffer = self.dev.allocator.alloc(len(pm4) * 4, BufferSpec(cpu_access=True))
     to_mv(cmd_buf.cpu_addr, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
 
     # collect all referenced BOs for the submit
@@ -291,6 +301,30 @@ class MSMProgram:
                                                 queueid=self.dev.queue_id)
     self.dev.last_fence = submit.fence
 
+    if os.getenv("MSM_TRACE_SUBMITS"):
+      print(
+        f"MSM_SUBMIT fence={submit.fence} fence_hex=0x{submit.fence:x} name={self.name} "
+        f"cmd=0x{cmd_buf.iova:016x} args=0x{args_buf.iova:016x} lib=0x{self.lib_buf.iova:016x} "
+        f"tex=0x{(args_buf.iova + self.tex_off):016x} ibo=0x{(args_buf.iova + self.ibo_off):016x} "
+        f"samp=0x{(args_buf.iova + self.samp_off):016x} "
+        f"ubos={[hex(b.iova) for b in ubos]} "
+        f"tex_bufs={[hex(buf.iova) for _, buf in texs]} "
+        f"ibo_bufs={[hex(buf.iova) for _, buf in ibos]}",
+        flush=True,
+      )
+    elif (threshold := _trace_high_iova_threshold()) is not None:
+      tracked = {
+        "cmd": cmd_buf.iova, "args": args_buf.iova, "lib": self.lib_buf.iova,
+        "tex": args_buf.iova + self.tex_off, "ibo": args_buf.iova + self.ibo_off,
+        **{f"ubo{i}": b.iova for i, b in enumerate(ubos)},
+        **{f"texbuf{i}": buf.iova for i, (_, buf) in enumerate(texs)},
+        **{f"ibobuf{i}": buf.iova for i, (_, buf) in enumerate(ibos)},
+      }
+      hits = {k: v for k, v in tracked.items() if v >= threshold}
+      if hits:
+        hit_str = " ".join(f"{k}=0x{v:016x}" for k, v in hits.items())
+        print(f"MSM_HIGH_SUBMIT fence={submit.fence} name={self.name} {hit_str}", flush=True)
+
     if wait:
       self.dev.synchronize()
       return float(time.perf_counter_ns() - st) * 1e-9
@@ -320,7 +354,7 @@ class MSMGraph(GraphRunner):
       gs, ls = tuple(ji.prg.p.global_size or (1, 1, 1)), tuple(ji.prg.p.local_size or (1, 1, 1))
 
       # build args buffer (same as MSMProgram.__call__)
-      args_buf: MSMBuffer = self.msm_dev.allocator.alloc(prg.kernargs_alloc_size)
+      args_buf: MSMBuffer = self.msm_dev.allocator.alloc(prg.kernargs_alloc_size, BufferSpec(cpu_access=True))
       ctypes.memset(args_buf.cpu_addr, 0, prg.kernargs_alloc_size)
 
       ubos = [b for i, b in enumerate(bufs_raw) for _, dt in prg.buf_dtypes[i] if not isinstance(dt, ImageDType)]
@@ -340,10 +374,13 @@ class MSMGraph(GraphRunner):
       def _tex(b, ibo=False):
         imgdt, buf = b
         fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
-        return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
+        return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
                 qreg.a6xx_tex_const_1(width=imgdt.shape[1], height=imgdt.shape[0]),
-                qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=imgdt.pitch, pitchalign=_ctz(imgdt.pitch) - 6), 0, *data64_le(buf.iova),
-                qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+                qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=imgdt.pitch, pitchalign=_ctz(imgdt.pitch) - 6),
+                0,
+                buf.iova & 0xFFFFFFFF,
+                (buf.iova >> 32) | qreg.a6xx_tex_const_5(depth=1),
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       if texs:
         to_mv(args_buf.cpu_addr + prg.tex_off, len(texs) * 0x40).cast('I')[:] = array.array('I', flatten(map(_tex, texs)))
       if ibos:
@@ -381,7 +418,7 @@ class MSMGraph(GraphRunner):
 
     # pre-build the concatenated command buffer, track chunk boundaries
     total_dwords = sum(len(pm4) for pm4 in all_pm4)
-    self.cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4)
+    self.cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4, BufferSpec(cpu_access=True))
     self.bo_handles.add(self.cmd_buf.handle)
     self.chunk_offsets: list[tuple[int, int]] = []  # (byte_offset, byte_size) per kernel
     offset = 0
@@ -496,9 +533,9 @@ class MSMDevice(Compiled):
     self.allocator = allocator
 
     # allocate device-internal buffers
-    self.dummy_buf: MSMBuffer = allocator.alloc(0x1000)
+    self.dummy_buf: MSMBuffer = allocator.alloc(0x1000, BufferSpec(cpu_access=True))
     ctypes.memset(self.dummy_buf.cpu_addr, 0, 0x1000)
-    self.border_color_buf: MSMBuffer = allocator.alloc(0x1000)
+    self.border_color_buf: MSMBuffer = allocator.alloc(0x1000, BufferSpec(cpu_access=True))
     ctypes.memset(self.border_color_buf.cpu_addr, 0, 0x1000)
 
     # compilers: IR3 only (no QCOMCLRenderer, that needs KGSL)
