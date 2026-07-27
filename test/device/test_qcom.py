@@ -1,7 +1,7 @@
 import ctypes, itertools, platform, struct, unittest
 from types import SimpleNamespace
 from tinygrad import Device
-from tinygrad.device import TinyELF
+from tinygrad.device import BufferSpec, TinyELF
 from tinygrad.helpers import mv_address, Target
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime.support.hcq import BumpAllocator, HCQBuffer
@@ -19,6 +19,12 @@ class RecordingIface:
   def submit(self, command, size, buffers):
     self.submissions.append((command, size, buffers))
     return 42
+
+class RecordingMemoryIface:
+  def __init__(self): self.mapped, self.maps = HCQBuffer(0x200000, 16), []
+  def map(self, ptr, size, fd=None, offset=0):
+    self.maps.append((ptr, size, fd, offset))
+    return self.mapped
 
 class TestQCOM(unittest.TestCase):
   def test_opencl_program_uses_instruction_groups(self):
@@ -96,6 +102,16 @@ class TestQCOM(unittest.TestCase):
     queue.submit(dev, {"address": 0x1800})
 
     self.assertEqual({buf.va_addr for buf in iface.submissions[0][2]}, {0x1800})
+
+  def test_allocator_forwards_external_buffer_metadata(self):
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
+    iface, allocator = RecordingMemoryIface(), object.__new__(QCOMAllocator)
+    allocator.dev = SimpleNamespace(iface=iface)
+    buf = allocator._alloc(16, BufferSpec(external_ptr=0x1234, external_fd=7, external_offset=0x40))
+
+    self.assertIs(buf, iface.mapped)
+    self.assertEqual(iface.maps, [(0x1234, 16, 7, 0x40)])
 
   # although part of the QCOM runtime, this tests flushing the CPU's dcache
   @unittest.skipUnless(isinstance(Device["CPU"].renderer, ClangRenderer) and platform.machine().lower() in {"arm64", "aarch64"},

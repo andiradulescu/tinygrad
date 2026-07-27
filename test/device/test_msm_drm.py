@@ -18,9 +18,9 @@ class RecordingMSMFile(FileIOInterface):
     self.memory = bytearray([0xaa] * mmap.PAGESIZE)
     self.cpu_addr = mv_address(memoryview(self.memory))
     self.news, self.infos, self.mmaps, self.unmaps, self.closed_handles = [], [], [], [], []
-    self.new_queues, self.submissions, self.waits, self.closed_queues = [], [], [], []
-    self.is_msm, self.chip_id = True, 0x06030000
-    self.set_iova_errno, self.wait_errno, self.munmap_result = None, None, 0
+    self.new_queues, self.submissions, self.waits, self.closed_queues, self.imports = [], [], [], [], []
+    self.is_msm, self.chip_id, self.import_handle = True, 0x06030000, 19
+    self.set_iova_errno, self.get_iova_errno, self.wait_errno, self.close_errno, self.munmap_result = None, None, None, None, 0
 
   def __del__(self): pass
 
@@ -28,10 +28,16 @@ class RecordingMSMFile(FileIOInterface):
     if request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
       self.news.append((arg.size, arg.flags))
       arg.handle = 17
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE):
+      self.imports.append((arg.fd, arg.flags))
+      arg.handle = self.import_handle
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_INFO):
       self.infos.append((arg.handle, arg.info, arg.value))
       if arg.info == msm_drm.MSM_INFO_GET_OFFSET: arg.value = 0x8000
       elif arg.info == msm_drm.MSM_INFO_SET_IOVA and self.set_iova_errno is not None: raise OSError(self.set_iova_errno, "set iova failed")
+      elif arg.info == msm_drm.MSM_INFO_GET_IOVA:
+        if self.get_iova_errno is not None: raise OSError(self.get_iova_errno, "get iova failed")
+        arg.value = 0x1234_0000
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM):
       if not self.is_msm: raise OSError(errno.ENOTTY, "not msm")
       arg.value = 630 if arg.param == msm_drm.MSM_PARAM_GPU_ID else self.chip_id
@@ -49,7 +55,9 @@ class RecordingMSMFile(FileIOInterface):
       self.waits.append((arg.fence, arg.flags, arg.timeout.tv_sec, arg.timeout.tv_nsec, arg.queueid))
       if self.wait_errno is not None: raise OSError(self.wait_errno, "wait failed")
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE): self.closed_queues.append(arg.value)
-    elif request == ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE): self.closed_handles.append(arg.handle)
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE):
+      self.closed_handles.append(arg.handle)
+      if self.close_errno is not None: raise OSError(self.close_errno, "close failed")
     return 0
 
   def mmap(self, start, size, prot, flags, offset):
@@ -95,6 +103,7 @@ class TestMSMDRMUAPI(unittest.TestCase):
       msm_drm.struct_drm_msm_gem_submit: (72, (0, 4, 8, 12, 16, 24, 32, 36, 40, 48, 56, 60, 64, 68)),
       msm_drm.struct_drm_msm_wait_fence: (32, (0, 4, 8, 24)),
       msm_drm.struct_drm_msm_submitqueue: (12, (0, 4, 8)),
+      msm_drm.struct_drm_prime_handle: (12, (0, 4, 8)),
     }
     for struct_type, (size, offsets) in layouts.items():
       with self.subTest(struct=struct_type.__name__):
@@ -106,6 +115,7 @@ class TestMSMDRMUAPI(unittest.TestCase):
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM), 0xC0186440)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT), 0xC0486446)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE), 0x40206447)
+    self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE), 0xC00C642E)
 
 
 class TestMSMIface(unittest.TestCase):
@@ -156,6 +166,90 @@ class TestMSMIface(unittest.TestCase):
 
     self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
     self.assertEqual(fd.closed_handles, [17])
+
+  def test_import_rejects_missing_fd_and_invalid_ranges(self):
+    iface = make_iface(RecordingMSMFile())
+    with self.assertRaisesRegex(ValueError, "DMA-BUF fd"): iface.map(0x1000, 16)
+    with self.assertRaisesRegex(ValueError, "non-negative"): iface.map(0x1000, 16, 9, -1)
+    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=0x100)):
+      with self.assertRaisesRegex(ValueError, "exceeds DMA-BUF size"): iface.map(0x1000, 0x20, 9, 0xf0)
+
+  def test_import_preserves_offset_and_submits_base_iova(self):
+    fd = RecordingMSMFile()
+    iface = make_iface(fd)
+    command = make_buffer(11, 0x1000_0000, 0x1000)
+    iface.allocations[11] = command.meta
+    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+      data = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
+
+    self.assertEqual((data.va_addr, data.cpu_view().addr, data.size), (0x1234_0040, fd.cpu_addr + 0x40, 17))
+    self.assertEqual(fd.imports, [(9, 0)])
+    iface.submit(command, 4, {data})
+    flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+    self.assertIn((flags, 19, 0x1234_0000), fd.submissions[0][2])
+
+    iface.free(data)
+    self.assertEqual(fd.unmaps, [])
+    self.assertEqual(fd.closed_handles, [19])
+
+  def test_repeated_import_closes_once_after_last_free(self):
+    fd = RecordingMSMFile()
+    iface = make_iface(fd)
+    command = make_buffer(11, 0x1000_0000, 0x1000)
+    iface.allocations[11] = command.meta
+    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+      first = iface.map(fd.cpu_addr, 17, 9)
+      second = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
+
+    self.assertIs(first.meta, second.meta)
+    self.assertEqual(first.meta.references, 2)
+    self.assertEqual(fd.imports, [(9, 0), (9, 0)])
+    self.assertEqual(sum(info == msm_drm.MSM_INFO_GET_IOVA for _,info,_ in fd.infos), 1)
+    iface.submit(command, 4, {first, second})
+    self.assertEqual([handle for _,handle,_ in fd.submissions[0][2]].count(19), 1)
+
+    iface.free(first)
+    self.assertEqual(fd.closed_handles, [])
+    self.assertIs(iface.allocations[19], second.meta)
+    iface.free(second)
+    self.assertEqual(fd.closed_handles, [19])
+    self.assertNotIn(19, iface.allocations)
+
+  def test_reimported_owned_allocation_retains_cpu_mapping(self):
+    fd = RecordingMSMFile()
+    iface, fd.import_handle = make_iface(fd), 17
+    original = iface.alloc(17)
+    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+      imported = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
+
+    iface.free(original)
+    self.assertEqual(fd.unmaps, [])
+    iface.free(imported)
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    self.assertEqual(fd.closed_handles, [17])
+
+  def test_import_closes_handle_if_iova_lookup_fails(self):
+    fd = RecordingMSMFile()
+    iface, fd.get_iova_errno = make_iface(fd), errno.EIO
+    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+      with self.assertRaisesRegex(OSError, "get iova failed"): iface.map(fd.cpu_addr, 17, 9)
+    self.assertEqual(fd.closed_handles, [19])
+
+  def test_free_can_retry_unmap_and_close_failures(self):
+    for failure in ("unmap", "close"):
+      with self.subTest(failure=failure):
+        fd = RecordingMSMFile()
+        iface = make_iface(fd)
+        buf = iface.alloc(17)
+        if failure == "unmap": fd.munmap_result = -1
+        else: fd.close_errno = errno.EIO
+
+        with self.assertRaisesRegex(RuntimeError, f"Failed to {failure}"): iface.free(buf)
+        self.assertIs(iface.allocations[17], buf.meta)
+
+        fd.munmap_result, fd.close_errno = 0, None
+        iface.free(buf)
+        self.assertNotIn(17, iface.allocations)
 
   def test_submit_uses_referenced_bos_and_command_offset(self):
     fd = RecordingMSMFile()

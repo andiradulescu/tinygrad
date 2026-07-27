@@ -379,6 +379,14 @@ class TestTinygrad(unittest.TestCase):
     z = (t+1)
     np.testing.assert_equal(z.numpy(), [1, 2, 3, 4])
 
+  def test_tensor_from_dma_buf(self):
+    x = memoryview(bytearray(16)).cast('I')
+    t = Tensor.from_blob(mv_address(x) + 4, (3,), dtype=dtypes.int, device="CPU", fd=7, offset=4)
+
+    self.assertEqual((t.uop.buffer.options.external_fd, t.uop.buffer.options.external_offset), (7, 4))
+    x[:] = array.array('I', [0, 1, 2, 3])
+    np.testing.assert_equal(t.numpy(), [1, 2, 3])
+
   def test_tensor_list_dtype(self):
     for arr in ([1], [[[1]]], [[1,1],[1,1]], [[[1,1],[1,1]],[[1,1],[1,1]]]):
       assert Tensor(arr).dtype == dtypes.default_int
