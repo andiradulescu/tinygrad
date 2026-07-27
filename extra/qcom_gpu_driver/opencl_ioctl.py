@@ -1,13 +1,18 @@
 # type: ignore
 import ctypes, ctypes.util, struct, fcntl, re
-from hexdump import hexdump
 from copy import deepcopy
 import pathlib, sys
 from tinygrad.helpers import to_mv, getenv
-from tinygrad.runtime.autogen import adreno
+from tinygrad.runtime.autogen import mesa as adreno
 sys.path.append(pathlib.Path(__file__).parent.parent.parent.as_posix())
 
 IOCTL = getenv("IOCTL", 0)
+
+def hexdump(data):
+  try: from hexdump import hexdump as print_hexdump
+  except ImportError:
+    for off in range(0, len(data), 16): print(f"{off:08X}: {' '.join(f'{x:02X}' for x in bytes(data[off:off+16]))}")
+  else: print_hexdump(data)
 
 ops = {}
 import xml.etree.ElementTree as ET
@@ -42,7 +47,7 @@ def get_struct(argp, stype):
 
 def format_struct(s):
   sdats = []
-  for field_name, *_ in s._real_fields_:
+  for field_name, *_ in getattr(s, "_real_fields_", None) or s._fields_:
     if field_name in {"__pad", "PADDING_0"}: continue
     dat = getattr(s, field_name)
     if isinstance(dat, int): sdats.append(f"{field_name}:0x{dat:X}")
@@ -96,8 +101,8 @@ def parse_cmd_buf(dat):
         CAPTURED_STATE['LOAD_FRAGS'].append((state_block, state_type, num_unit, dst_off))
 
         if state_block == SB6_CS_SHADER:
-          from extra.disassemblers.adreno import disasm_raw
           if state_type == ST6_SHADER and IOCTL > 3:
+            from extra.disassemblers.adreno import disasm_raw
             disasm_raw(get_mem(((vals[2] << 32) | vals[1]), num_unit * 128))
           if state_type == ST6_CONSTANTS:
             x = get_mem(((vals[2] << 32) | vals[1]), num_unit*4)
