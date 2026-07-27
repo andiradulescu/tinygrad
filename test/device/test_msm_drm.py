@@ -1,7 +1,7 @@
-import ctypes, errno, mmap, os, unittest
+import contextlib, ctypes, errno, mmap, os, unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import call, Mock, patch
 
 import tinygrad.runtime.autogen as autogen
 from tinygrad.device import BufferSpec
@@ -351,6 +351,37 @@ class TestMSMIface(unittest.TestCase):
       call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
       call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
     ])
+
+  def test_copy_to_imported_buffer_uses_copyin(self):
+    from tinygrad.engine.realize import exec_copy
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
+    fd = RecordingMSMFile()
+    iface = make_iface(fd)
+    dev = SimpleNamespace(device="QCOM", iface=iface, synchronize=lambda: None)
+    iface.dev = dev
+    allocator = object.__new__(QCOMAllocator)
+    allocator.dev, allocator.supports_transfer = dev, False
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
+      data = iface.map(fd.cpu_addr, 17, 9)
+
+    dest = SimpleNamespace(device="QCOM", allocator=allocator, _buf=data, nbytes=17)
+    dest.ensure_allocated = lambda: dest
+    dest.as_memoryview = Mock(side_effect=AssertionError("zero-copy is unavailable"))
+    source = memoryview(bytearray(range(17)))
+    src_allocator = SimpleNamespace(_copyout=Mock())
+    src = SimpleNamespace(device="PYTHON", allocator=src_allocator, _buf=source, nbytes=17)
+    src.ensure_allocated, src.as_memoryview = lambda: src, lambda **kwargs: source
+
+    with patch("tinygrad.engine.realize.resolve_params", return_value=[]), \
+         patch("tinygrad.engine.realize.unwrap_multi", return_value=[([dest, src], {})]), \
+         patch("tinygrad.engine.realize.track_stats", return_value=contextlib.nullcontext()), \
+         patch.object(allocator, "_copyin") as copyin:
+      exec_copy(SimpleNamespace(input_uops=[], var_vals={}), SimpleNamespace(), SimpleNamespace())
+
+    copyin.assert_called_once_with(data, source)
+    src_allocator._copyout.assert_not_called()
+    dest.as_memoryview.assert_not_called()
 
   def test_import_closes_handle_if_iova_lookup_fails(self):
     fd = RecordingMSMFile()
