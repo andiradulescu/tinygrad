@@ -129,6 +129,12 @@ def __getattr__(nm):
                                                                                                "sienna_cichlid_ip_offset"]],
                                 args=["-I/opt/rocm/include", "-x", "c++"])
     case "amdgpu_drm": return load("amdgpu_drm", [ "/usr/include/drm/drm.h", *[root/f"extra/hip_gpu_driver/{s}.h" for s in ["amdgpu_drm"]]])
+    case "dma_buf":
+      return load("dma_buf", ["{}/usr/include/linux/dma-buf.h"],
+                  args=["--target=aarch64-linux-gnu", "-nostdinc", "-I{}/usr/include/aarch64-linux-gnu", "-I{}/usr/include"],
+                  srcs=linux_headers_deb,
+                  preprocess=lambda path: subprocess.run(f"ar x {linux_headers_deb.split('/')[-1]} && tar xf data.tar.xz",
+                                                         cwd=path, shell=True, check=True))
     case "msm_drm":
       return load("msm_drm", ["{}/usr/include/drm/drm.h", "{}/usr/include/drm/msm_drm.h"],
                   args=["--target=aarch64-linux-gnu", "-nostdinc", "-I{}/usr/include/aarch64-linux-gnu", "-I{}/usr/include", "-I{}/usr/include/drm"],

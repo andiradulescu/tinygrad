@@ -1,10 +1,12 @@
-import ctypes, errno, mmap, unittest
+import ctypes, errno, mmap, os, unittest
+from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import tinygrad.runtime.autogen as autogen
+from tinygrad.device import BufferSpec
 from tinygrad.helpers import mv_address
-from tinygrad.runtime.autogen import msm_drm
+from tinygrad.runtime.autogen import dma_buf, msm_drm
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
 
@@ -84,6 +86,14 @@ def make_buffer(handle, iova, size):
 
 
 class TestMSMDRMUAPI(unittest.TestCase):
+  def test_dma_buf_autogen_targets_aarch64(self):
+    with patch.object(autogen, "load") as load:
+      autogen.__getattr__("dma_buf")
+
+    args = load.call_args.kwargs["args"]
+    self.assertIn("--target=aarch64-linux-gnu", args)
+    self.assertIn("-I{}/usr/include/aarch64-linux-gnu", args)
+
   def test_autogen_targets_aarch64(self):
     with patch.object(autogen, "load") as load:
       autogen.__getattr__("msm_drm")
@@ -94,6 +104,7 @@ class TestMSMDRMUAPI(unittest.TestCase):
 
   def test_struct_layouts(self):
     layouts = {
+      dma_buf.struct_dma_buf_sync: (8, (0,)),
       msm_drm.struct_drm_msm_timespec: (16, (0, 8)),
       msm_drm.struct_drm_msm_param: (24, (0, 4, 8, 16, 20)),
       msm_drm.struct_drm_msm_gem_new: (16, (0, 8, 12)),
@@ -112,6 +123,7 @@ class TestMSMDRMUAPI(unittest.TestCase):
         self.assertEqual(tuple(field[2] for field in struct_type._real_fields_), offsets)
 
   def test_ioctl_numbers_include_linux_struct_sizes(self):
+    self.assertEqual(ioctl_number(dma_buf.DMA_BUF_IOCTL_SYNC), 0x40086200)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM), 0xC0186440)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT), 0xC0486446)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE), 0x40206447)
@@ -119,6 +131,12 @@ class TestMSMDRMUAPI(unittest.TestCase):
 
 
 class TestMSMIface(unittest.TestCase):
+  def setUp(self):
+    dup_patcher, close_patcher = patch("tinygrad.runtime.ops_qcom.os.dup", return_value=109), patch("tinygrad.runtime.ops_qcom.os.close")
+    self.dup, self.close = dup_patcher.start(), close_patcher.start()
+    self.addCleanup(dup_patcher.stop)
+    self.addCleanup(close_patcher.stop)
+
   def test_init_selects_msm_render_node_and_a630(self):
     bad, good = RecordingMSMFile(), RecordingMSMFile()
     bad.is_msm = False
@@ -171,7 +189,7 @@ class TestMSMIface(unittest.TestCase):
     iface = make_iface(RecordingMSMFile())
     with self.assertRaisesRegex(ValueError, "DMA-BUF fd"): iface.map(0x1000, 16)
     with self.assertRaisesRegex(ValueError, "non-negative"): iface.map(0x1000, 16, 9, -1)
-    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=0x100)):
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=0x100):
       with self.assertRaisesRegex(ValueError, "exceeds DMA-BUF size"): iface.map(0x1000, 0x20, 9, 0xf0)
 
   def test_import_preserves_offset_and_submits_base_iova(self):
@@ -179,10 +197,11 @@ class TestMSMIface(unittest.TestCase):
     iface = make_iface(fd)
     command = make_buffer(11, 0x1000_0000, 0x1000)
     iface.allocations[11] = command.meta
-    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE) as lseek:
       data = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
 
     self.assertEqual((data.va_addr, data.cpu_view().addr, data.size), (0x1234_0040, fd.cpu_addr + 0x40, 17))
+    self.assertEqual(lseek.call_args_list, [call(9, 0, os.SEEK_END), call(9, 0, os.SEEK_SET)])
     self.assertEqual(fd.imports, [(9, 0)])
     iface.submit(command, 4, {data})
     flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
@@ -191,13 +210,15 @@ class TestMSMIface(unittest.TestCase):
     iface.free(data)
     self.assertEqual(fd.unmaps, [])
     self.assertEqual(fd.closed_handles, [19])
+    self.dup.assert_called_once_with(9)
+    self.close.assert_called_once_with(109)
 
   def test_repeated_import_closes_once_after_last_free(self):
     fd = RecordingMSMFile()
     iface = make_iface(fd)
     command = make_buffer(11, 0x1000_0000, 0x1000)
     iface.allocations[11] = command.meta
-    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
       first = iface.map(fd.cpu_addr, 17, 9)
       second = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
 
@@ -215,25 +236,63 @@ class TestMSMIface(unittest.TestCase):
     self.assertEqual(fd.closed_handles, [19])
     self.assertNotIn(19, iface.allocations)
 
-  def test_reimported_owned_allocation_retains_cpu_mapping(self):
+  def test_reimported_owned_allocation_bypasses_lru_until_alias_is_freed(self):
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
     fd = RecordingMSMFile()
     iface, fd.import_handle = make_iface(fd), 17
+    dev = SimpleNamespace(iface=iface, synchronize=lambda: None)
+    iface.dev = dev
+    allocator = object.__new__(QCOMAllocator)
+    allocator.dev, allocator.cache, allocator.default_buffer_spec = dev, defaultdict(list), BufferSpec()
     original = iface.alloc(17)
-    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
       imported = iface.map(fd.cpu_addr + 0x40, 17, 9, 0x40)
 
-    iface.free(original)
-    self.assertEqual(fd.unmaps, [])
-    iface.free(imported)
+    allocator.free(original, original.size, BufferSpec())
+    self.assertEqual((original.meta.references, allocator.cache), (1, {}))
+    allocator.free(imported, imported.size, BufferSpec(external_ptr=fd.cpu_addr + 0x40, external_fd=9, external_offset=0x40))
     self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
     self.assertEqual(fd.closed_handles, [17])
+
+  def test_cpu_access_syncs_imported_dma_buf(self):
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
+    fd, syncs = RecordingMSMFile(), []
+    iface = make_iface(fd)
+    dev = SimpleNamespace(device="QCOM", iface=iface, synchronize=lambda: syncs.append("gpu"))
+    iface.dev = dev
+    allocator = object.__new__(QCOMAllocator)
+    allocator.dev = dev
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
+      data = iface.map(fd.cpu_addr, 17, 9)
+
+    source, output = memoryview(bytearray(range(17))), memoryview(bytearray(17))
+    with patch("tinygrad.runtime.ops_qcom.dma_buf.DMA_BUF_IOCTL_SYNC") as sync:
+      allocator._copyin(data, source)
+      allocator._copyout(output, data)
+      with self.assertRaisesRegex(RuntimeError, "CPU access failed"):
+        with iface.cpu_access(data, dma_buf.DMA_BUF_SYNC_READ): raise RuntimeError("CPU access failed")
+
+    self.assertEqual(output, source)
+    self.assertEqual(syncs, ["gpu", "gpu"])
+    self.assertEqual(sync.call_args_list, [
+      call(109, flags=dma_buf.DMA_BUF_SYNC_WRITE),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_WRITE | dma_buf.DMA_BUF_SYNC_END),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
+    ])
+    self.assertFalse(allocator._can_as_buffer(data))
 
   def test_import_closes_handle_if_iova_lookup_fails(self):
     fd = RecordingMSMFile()
     iface, fd.get_iova_errno = make_iface(fd), errno.EIO
-    with patch("tinygrad.runtime.ops_qcom.os.fstat", return_value=SimpleNamespace(st_size=mmap.PAGESIZE)):
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
       with self.assertRaisesRegex(OSError, "get iova failed"): iface.map(fd.cpu_addr, 17, 9)
     self.assertEqual(fd.closed_handles, [19])
+    self.close.assert_called_once_with(109)
 
   def test_free_can_retry_unmap_and_close_failures(self):
     for failure in ("unmap", "close"):

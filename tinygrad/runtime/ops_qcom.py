@@ -6,7 +6,7 @@ from typing import Any, cast
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
-from tinygrad.runtime.autogen import kgsl, mesa, msm_drm
+from tinygrad.runtime.autogen import dma_buf, kgsl, mesa, msm_drm
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, ceildiv, prod, cpu_profile, lo32, suppress_finalizing, is_image_shape
@@ -350,14 +350,24 @@ class QCOMAllocator(HCQAllocatorBase):
     if opts.external_ptr is not None: return self.dev.iface.map(opts.external_ptr, size, opts.external_fd, opts.external_offset)
     return self.dev.iface.alloc(size)
 
-  def _do_copy(self, src_addr, dest_addr, size, prof_text):
-    self.dev.synchronize()
-    with cpu_profile(prof_text, f"{self.dev.device}:COPY"): ctypes.memmove(dest_addr, src_addr, size)
+  def free(self, opaque:HCQBuffer, size:int, options:BufferSpec|None=None):
+    if isinstance(allocation:=opaque.base.meta, MSMAllocation) and allocation.references > 1:
+      return self._free(opaque, options)
+    return super().free(opaque, size, options)
 
-  def _copyin(self, dest:HCQBuffer, src:memoryview): self._do_copy(mv_address(src), dest.cpu_view().addr, src.nbytes, f"TINY -> {self.dev.device}")
-  def _copyout(self, dest:memoryview, src:HCQBuffer): self._do_copy(src.cpu_view().addr, mv_address(dest), src.size, f"{self.dev.device} -> TINY")
+  def _do_copy(self, src_addr, dest_addr, size, prof_text, buf:HCQBuffer, flags:int):
+    self.dev.synchronize()
+    access = self.dev.iface.cpu_access(buf, flags) if hasattr(self.dev.iface, "cpu_access") else contextlib.nullcontext()
+    with access, cpu_profile(prof_text, f"{self.dev.device}:COPY"): ctypes.memmove(dest_addr, src_addr, size)
+
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    self._do_copy(mv_address(src), dest.cpu_view().addr, src.nbytes, f"TINY -> {self.dev.device}", dest, dma_buf.DMA_BUF_SYNC_WRITE)
+  def _copyout(self, dest:memoryview, src:HCQBuffer):
+    self._do_copy(src.cpu_view().addr, mv_address(dest), src.size, f"{self.dev.device} -> TINY", src, dma_buf.DMA_BUF_SYNC_READ)
 
   def _as_buffer(self, src:HCQBuffer) -> memoryview: return to_mv(src.cpu_view().addr, src.size)
+  def _can_as_buffer(self, src:HCQBuffer) -> bool:
+    return not isinstance(allocation:=src.base.meta, MSMAllocation) or allocation.dma_buf_fd is None
 
   def _do_free(self, opaque, options:BufferSpec): self.dev.iface.free(opaque)
 
@@ -435,6 +445,7 @@ class MSMAllocation:
   iova: int
   size: int
   cpu_mapping: tuple[int, int]|None
+  dma_buf_fd: int|None = None
   references: int = 1
 
 def _open_msm_render_node(path:str) -> FileIOInterface|None:
@@ -464,6 +475,15 @@ class MSMIface:
     self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
     self.allocations:dict[int, MSMAllocation] = {}
 
+  def _close_import(self, handle:int, fd:int|None):
+    errors:list[OSError] = []
+    try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=handle)
+    except OSError as e: errors.append(e)
+    if fd is not None:
+      try: os.close(fd)
+      except OSError as e: errors.append(e)
+    if errors: raise RuntimeError(f"MSM DMA-BUF import cleanup failed for GEM handle {handle}: {'; '.join(map(str, errors))}") from errors[0]
+
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
     mapped_size = round_up(size, mmap.PAGESIZE)
@@ -490,24 +510,26 @@ class MSMIface:
     if fd is None: raise ValueError("MSM DRM external pointers require a DMA-BUF fd")
     if size <= 0: raise ValueError(f"MSM mapping size must be positive, got {size}")
     if offset < 0: raise ValueError(f"DMA-BUF offset must be non-negative, got {offset}")
-    if offset + size > (dma_buf_size:=os.fstat(fd).st_size):
+    dma_buf_size = os.lseek(fd, 0, os.SEEK_END)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if offset + size > dma_buf_size:
       raise ValueError(f"DMA-BUF range [{offset}, {offset + size}) exceeds DMA-BUF size {dma_buf_size}")
 
     imported = msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE(self.fd, fd=fd)
     allocation = self.allocations.get(imported.handle)
     if allocation is None:
-      try: iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=imported.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
+      retained_fd = None
+      try:
+        retained_fd = os.dup(fd)
+        iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=imported.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
       except Exception:
-        try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=imported.handle)
-        except OSError as e: raise RuntimeError(f"MSM DMA-BUF import cleanup failed for GEM handle {imported.handle}") from e
+        self._close_import(imported.handle, retained_fd)
         raise
-      allocation = MSMAllocation(imported.handle, iova, dma_buf_size, None)
+      allocation = MSMAllocation(imported.handle, iova, dma_buf_size, None, retained_fd)
 
     try: buf = HCQBuffer(allocation.iova + offset, size, meta=allocation, view=MMIOInterface(ptr, size), owner=self.dev)
     except Exception:
-      if imported.handle not in self.allocations:
-        try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=imported.handle)
-        except OSError as close_error: raise RuntimeError(f"MSM DMA-BUF import cleanup failed for GEM handle {imported.handle}") from close_error
+      if imported.handle not in self.allocations: self._close_import(imported.handle, allocation.dma_buf_fd)
       raise
 
     if imported.handle in self.allocations:
@@ -530,6 +552,10 @@ class MSMIface:
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     allocation.references = 0
     self.allocations.pop(allocation.handle, None)
+    if allocation.dma_buf_fd is not None:
+      try: os.close(allocation.dma_buf_fd)
+      except OSError as e: raise RuntimeError(f"Failed to close DMA-BUF fd for MSM GEM handle {allocation.handle}") from e
+      allocation.dma_buf_fd = None
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
     if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation
@@ -538,6 +564,16 @@ class MSMIface:
                if allocation.iova <= mem.va_addr and mem.va_addr + mem.size <= allocation.iova + allocation.size]
     if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
     return matches[0]
+
+  @contextlib.contextmanager
+  def cpu_access(self, mem:HCQBuffer, flags:int):
+    allocation = self._resolve_allocation(mem)
+    if allocation.dma_buf_fd is None:
+      yield
+      return
+    dma_buf.DMA_BUF_IOCTL_SYNC(allocation.dma_buf_fd, flags=flags)
+    try: yield
+    finally: dma_buf.DMA_BUF_IOCTL_SYNC(allocation.dma_buf_fd, flags=flags | dma_buf.DMA_BUF_SYNC_END)
 
   def submit(self, command:HCQBuffer, size:int, buffers:set[HCQBuffer]) -> int:
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")

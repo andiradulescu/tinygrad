@@ -196,7 +196,8 @@ class Buffer:
            (f" offset:{self.offset}" if self._base is not None else "") + (f" {self.options=}" if self.options is not None else "") + ">"
   def as_memoryview(self, allow_zero_copy=False, force_zero_copy=False, no_sync=False) -> memoryview:
     # zero copy with as_memoryview (disabled by default due to use after free)
-    if (force_zero_copy or allow_zero_copy) and hasattr(self.allocator, '_as_buffer'):
+    if (force_zero_copy or allow_zero_copy) and hasattr(self.allocator, '_as_buffer') and \
+       (not hasattr(self.allocator, '_can_as_buffer') or self.allocator._can_as_buffer(self._buf)):
       if not no_sync: self.allocator.dev.synchronize()
       return self.allocator._as_buffer(self._buf)
     assert not force_zero_copy, "force zero copy was passed, but copy is required"
