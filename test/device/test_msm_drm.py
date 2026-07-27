@@ -333,6 +333,25 @@ class TestMSMIface(unittest.TestCase):
     ])
     self.assertFalse(allocator._can_as_buffer(data))
 
+  def test_cpu_access_retries_interrupted_dma_buf_sync(self):
+    fd = RecordingMSMFile()
+    iface = make_iface(fd)
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
+      data = iface.map(fd.cpu_addr, 17, 9)
+
+    with patch("tinygrad.runtime.ops_qcom.dma_buf.DMA_BUF_IOCTL_SYNC",
+               side_effect=[OSError(errno.EAGAIN, "again"), OSError(errno.EINTR, "interrupted"), None,
+                            OSError(errno.EAGAIN, "again"), None]) as sync:
+      with iface.cpu_access(data, dma_buf.DMA_BUF_SYNC_READ): pass
+
+    self.assertEqual(sync.call_args_list, [
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
+    ])
+
   def test_import_closes_handle_if_iova_lookup_fails(self):
     fd = RecordingMSMFile()
     iface, fd.get_iova_errno = make_iface(fd), errno.EIO

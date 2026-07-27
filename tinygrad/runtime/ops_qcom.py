@@ -19,6 +19,14 @@ BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
 # Kernel waits are sliced so HCQSignal.wait retains progress tracking and the overall timeout.
 NS_PER_SEC, MSM_WAIT_SLICE_NS = 1_000_000_000, 1_000_000
 
+def _dma_buf_sync(fd:int, flags:int):
+  while True:
+    try:
+      dma_buf.DMA_BUF_IOCTL_SYNC(fd, flags=flags)
+      return
+    except OSError as e:
+      if e.errno not in (errno.EAGAIN, errno.EINTR): raise
+
 @functools.cache
 def dcache_flush():
   from tinygrad.uop.ops import UOp, Ops, KernelInfo
@@ -584,9 +592,9 @@ class MSMIface:
     if allocation.dma_buf_fd is None:
       yield
       return
-    dma_buf.DMA_BUF_IOCTL_SYNC(allocation.dma_buf_fd, flags=flags)
+    _dma_buf_sync(allocation.dma_buf_fd, flags)
     try: yield
-    finally: dma_buf.DMA_BUF_IOCTL_SYNC(allocation.dma_buf_fd, flags=flags | dma_buf.DMA_BUF_SYNC_END)
+    finally: _dma_buf_sync(allocation.dma_buf_fd, flags | dma_buf.DMA_BUF_SYNC_END)
 
   def submit(self, command:HCQBuffer, size:int, buffers:set[HCQBuffer]) -> int:
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
