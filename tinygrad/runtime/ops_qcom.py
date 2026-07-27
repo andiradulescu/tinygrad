@@ -346,8 +346,16 @@ class QCOMProgram(HCQProgram['QCOMDevice']):
     self.fregs, self.hregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18)
 
 class QCOMAllocator(HCQAllocatorBase):
+  def _evict_cached_allocation(self, allocation:MSMAllocation):
+    for (_, options), opaques in self.cache.items():
+      for i in range(len(opaques)-1, -1, -1):
+        if opaques[i].base.meta is allocation: self._free(opaques.pop(i), options)
+
   def _alloc(self, size:int, opts:BufferSpec) -> HCQBuffer:
-    if opts.external_ptr is not None: return self.dev.iface.map(opts.external_ptr, size, opts.external_fd, opts.external_offset)
+    if opts.external_ptr is not None:
+      mapped = self.dev.iface.map(opts.external_ptr, size, opts.external_fd, opts.external_offset)
+      if isinstance(allocation:=mapped.base.meta, MSMAllocation): self._evict_cached_allocation(allocation)
+      return mapped
     return self.dev.iface.alloc(size)
 
   def free(self, opaque:HCQBuffer, size:int, options:BufferSpec|None=None):
@@ -517,8 +525,8 @@ class MSMIface:
 
     imported = msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE(self.fd, fd=fd)
     allocation = self.allocations.get(imported.handle)
+    retained_fd = None
     if allocation is None:
-      retained_fd = None
       try:
         retained_fd = os.dup(fd)
         iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=imported.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
@@ -526,10 +534,15 @@ class MSMIface:
         self._close_import(imported.handle, retained_fd)
         raise
       allocation = MSMAllocation(imported.handle, iova, dma_buf_size, None, retained_fd)
+    elif allocation.dma_buf_fd is None:
+      allocation.dma_buf_fd = retained_fd = os.dup(fd)
 
     try: buf = HCQBuffer(allocation.iova + offset, size, meta=allocation, view=MMIOInterface(ptr, size), owner=self.dev)
     except Exception:
       if imported.handle not in self.allocations: self._close_import(imported.handle, allocation.dma_buf_fd)
+      elif retained_fd is not None:
+        allocation.dma_buf_fd = None
+        os.close(retained_fd)
       raise
 
     if imported.handle in self.allocations:

@@ -255,6 +255,53 @@ class TestMSMIface(unittest.TestCase):
     self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
     self.assertEqual(fd.closed_handles, [17])
 
+  def test_cached_owned_allocation_is_evicted_when_imported(self):
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
+    fd = RecordingMSMFile()
+    iface, fd.import_handle = make_iface(fd), 17
+    dev = SimpleNamespace(iface=iface, synchronize=lambda: None)
+    iface.dev = dev
+    allocator = object.__new__(QCOMAllocator)
+    allocator.dev, allocator.cache, allocator.default_buffer_spec = dev, defaultdict(list), BufferSpec()
+    original = iface.alloc(17)
+    allocator.free(original, original.size, BufferSpec())
+    self.assertEqual(allocator.cache[(17, BufferSpec())], [original])
+
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
+      imported = allocator.alloc(17, BufferSpec(external_ptr=fd.cpu_addr, external_fd=9))
+
+    self.assertIs(imported.meta, original.meta)
+    self.assertEqual(imported.meta.references, 1)
+    self.assertEqual(allocator.cache[(17, BufferSpec())], [])
+    allocator.free(imported, imported.size, BufferSpec(external_ptr=fd.cpu_addr, external_fd=9))
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    self.assertEqual(fd.closed_handles, [17])
+
+  def test_reimported_owned_allocation_retains_dma_buf_sync(self):
+    from tinygrad.runtime.ops_qcom import QCOMAllocator
+
+    fd = RecordingMSMFile()
+    iface, fd.import_handle = make_iface(fd), 17
+    original = iface.alloc(17)
+    with patch("tinygrad.runtime.ops_qcom.os.lseek", return_value=mmap.PAGESIZE):
+      imported = iface.map(fd.cpu_addr, 17, 9)
+
+    allocator = object.__new__(QCOMAllocator)
+    self.assertEqual(imported.meta.dma_buf_fd, 109)
+    self.assertFalse(allocator._can_as_buffer(imported))
+    with patch("tinygrad.runtime.ops_qcom.dma_buf.DMA_BUF_IOCTL_SYNC") as sync:
+      with iface.cpu_access(imported, dma_buf.DMA_BUF_SYNC_READ): pass
+    self.assertEqual(sync.call_args_list, [
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ),
+      call(109, flags=dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END),
+    ])
+
+    iface.free(imported)
+    iface.free(original)
+    self.dup.assert_called_once_with(9)
+    self.close.assert_called_once_with(109)
+
   def test_cpu_access_syncs_imported_dma_buf(self):
     from tinygrad.runtime.ops_qcom import QCOMAllocator
 
