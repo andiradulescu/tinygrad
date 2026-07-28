@@ -61,19 +61,38 @@ class QCOMSignal(HCQSignal):
 class QCOMComputeQueue(HWQueue):
   def __init__(self, dev:QCOMDevice):
     self.dev = dev
+    self._buffers:dict[HCQBuffer, int|None]|None = {} if dev.iface.submit_requires_buffers else None
     super().__init__()
 
   @suppress_finalizing
   def __del__(self):
-    if self.binded_device is not None: self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
+    if (dev:=getattr(self, "binded_device", None)) is not None and (hw_page:=getattr(self, "hw_page", None)) is not None:
+      dev.allocator.free(hw_page, hw_page.size, BufferSpec(cpu_access=True, nolru=True))
 
   def cmd(self, opcode: int, *vals: int): self.q(pkt7_hdr(opcode, len(vals)), *vals)
 
   def reg(self, reg: int, *vals: int): self.q(pkt4_hdr(reg, len(vals)), *vals)
 
+  def _add_buffers(self, *bufs:HCQBuffer):
+    if self._buffers is None: return
+    for buf in bufs:
+      base = buf.base
+      if base not in self._buffers: self._buffers[base] = None if isinstance(base.va_addr, int) else self._new_sym(base.va_addr)
+
+  def _resolve_submit_buffers(self) -> set[HCQBuffer]:
+    if self._buffers is None: return set()
+    buffers:set[HCQBuffer] = set()
+    for buf, sym_idx in self._buffers.items():
+      if sym_idx is None: buffers.add(buf)
+      elif (address:=self._prev_resolved_syms[sym_idx]) is None: raise RuntimeError("QCOM queue has an unresolved symbolic buffer address")
+      else: buffers.add(HCQBuffer(address, buf.size))
+    return buffers
+
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
     # TODO: 7xx support.
-    if write_back: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
+    if write_back:
+      self._add_buffers(self.dev.dummy_buf)
+      self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
     if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
@@ -83,6 +102,7 @@ class QCOMComputeQueue(HWQueue):
     return self
 
   def signal(self, signal:QCOMSignal, value=0):
+    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     if self.dev.gpu_id[:2] < (7, 3):
       self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), *data64_le(signal.value_addr), lo32(value))
@@ -93,11 +113,13 @@ class QCOMComputeQueue(HWQueue):
     return self
 
   def timestamp(self, signal:QCOMSignal):
+    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True),*data64_le(signal.timestamp_addr))
     return self
 
   def wait(self, signal:QCOMSignal, value=0):
+    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY),*data64_le(signal.value_addr),
              qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
     return self
@@ -113,16 +135,21 @@ class QCOMComputeQueue(HWQueue):
   def bind(self, dev:QCOMDevice):
     self.binded_device = dev
     self.hw_page = self._build_gpu_command(dev, dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True)))
-    self.prepared_submit = dev.iface.prepare_submit(self.hw_page, len(self._q) * 4)
+    self.prepared_submit = None if self._buffers is not None and any(x is not None for x in self._buffers.values()) \
+      else dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
     # From now on, the queue is on the device for faster submission.
     self._q = self.hw_page.cpu_view().view(fmt='I')
 
   def _submit(self, dev:QCOMDevice):
-    prepared = self.prepared_submit if self.binded_device == dev else dev.iface.prepare_submit(self._build_gpu_command(dev), len(self._q) * 4)
+    prepared = self.prepared_submit if self.binded_device == dev and self.prepared_submit is not None \
+      else dev.iface.prepare_submit(self.hw_page if self.binded_device == dev else self._build_gpu_command(dev),
+                                    len(self._q) * 4, self._resolve_submit_buffers())
     dev.last_cmd = dev.iface.submit(prepared)
 
   def exec(self, prg:QCOMProgram, args_state:QCOMArgsState, global_size, local_size):
     self.bind_args_state(args_state)
+    self._add_buffers(args_state.buf, prg.lib_gpu, prg.dev._stack, *args_state.bufs)
+    if prg.samp_cnt > 0: self._add_buffers(prg.dev.border_color_buf)
 
     def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
@@ -346,6 +373,7 @@ def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, 
 
 class KGSLIface:
   count = 1
+  submit_requires_buffers = False
   renderers = [QCOMCLRenderer, IR3Renderer]
 
   def __init__(self, dev:QCOMDevice, device_id:int):
@@ -397,7 +425,7 @@ class KGSLIface:
       kgsl.IOCTL_KGSL_GPUOBJ_FREE(self.fd, id=mem.meta[0].id)
       FileIOInterface.munmap(mem.va_addr, mem.meta[0].mmapsize)
 
-  def prepare_submit(self, command:HCQBuffer, size:int):
+  def prepare_submit(self, command:HCQBuffer, size:int, _buffers:set[HCQBuffer]):
     obj = kgsl.struct_kgsl_command_object(gpuaddr=command.va_addr, size=size, flags=kgsl.KGSL_CMDLIST_IB)
     req = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(obj), numcmds=1, context_id=self.ctx,
                                        cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object))
@@ -431,6 +459,7 @@ def _open_msm_render_node(path:str) -> FileIOInterface|None:
 
 class MSMIface:
   count = 1
+  submit_requires_buffers = True
   renderers = [IR3Renderer]
 
   def __init__(self, dev:QCOMDevice, device_id:int):
@@ -446,12 +475,12 @@ class MSMIface:
     self.gpu_id = (self.chip_id >> 24, (self.chip_id >> 16) & 0xff, (self.chip_id >> 8) & 0xff)
     if self.gpu_id != (6, 3, 0): raise RuntimeError(f"MSM DRM requires Adreno 630, got chip_id={self.chip_id:#x}")
     self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
+    self.allocations:dict[int, MSMAllocation] = {}
 
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
     mapped_size = round_up(size, mmap.PAGESIZE)
-    flags = msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=flags)
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
     cpu_addr = None
     try:
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
@@ -467,30 +496,44 @@ class MSMIface:
 
     if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
     allocation = MSMAllocation(gem.handle, cpu_addr, mapped_size)
+    self.allocations[gem.handle] = allocation
     return HCQBuffer(cpu_addr, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
 
   def map(self, _ptr:int, _size:int) -> HCQBuffer: raise RuntimeError("MSM DRM does not support external pointer mapping")
 
   def free(self, mem:HCQBuffer):
     if not isinstance(allocation:=mem.base.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
     unmap_error = self.fd.munmap(allocation.iova, allocation.mapped_size) != 0
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     if unmap_error: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
+    self.allocations.pop(allocation.handle)
 
-  def prepare_submit(self, command:HCQBuffer, size:int):
+  def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
+    if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation
+    if not isinstance(mem.va_addr, int): raise RuntimeError("MSM buffer address must be resolved before submission")
+    matches = [allocation for allocation in self.allocations.values()
+               if allocation.iova <= mem.va_addr and mem.va_addr + mem.size <= allocation.iova + allocation.mapped_size]
+    if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    return matches[0]
+
+  def prepare_submit(self, command:HCQBuffer, size:int, buffers:set[HCQBuffer]):
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
-    if not isinstance(allocation:=command.base.meta, MSMAllocation):
-      raise RuntimeError("MSM command buffer was not allocated by the MSM DRM interface")
-    command_offset = int(command.va_addr) - allocation.iova
-    if command_offset < 0 or size > command.size or command_offset + size > allocation.mapped_size:
+    command_allocation = self._resolve_allocation(command)
+    command_offset = int(command.va_addr) - command_allocation.iova
+    if command_offset < 0 or size > command.size or command_offset + size > command_allocation.mapped_size:
       raise ValueError("MSM command range is outside its buffer")
 
-    bos = (msm_drm.struct_drm_msm_gem_submit_bo * 1)(
-      msm_drm.struct_drm_msm_gem_submit_bo(flags=msm_drm.MSM_SUBMIT_BO_READ, handle=allocation.handle, presumed=allocation.iova))
+    submit_allocations = {command_allocation.handle:command_allocation}
+    submit_allocations.update((allocation.handle, allocation) for allocation in map(self._resolve_allocation, buffers))
+    allocations = list(submit_allocations.values())
+    flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+    bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(allocations))(*[
+      msm_drm.struct_drm_msm_gem_submit_bo(flags=flags, handle=allocation.handle, presumed=allocation.iova) for allocation in allocations])
     cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(
       msm_drm.struct_drm_msm_gem_submit_cmd(type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
-    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=1, nr_cmds=1,
+    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=len(bos), nr_cmds=1,
                                                bos=ctypes.addressof(bos), cmds=ctypes.addressof(cmds), queueid=self.queue_id)
     return submit, bos, cmds
 
@@ -524,7 +567,8 @@ class QCOMDevice(HCQCompiled):
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={self.iface.chip_id:#x}")
 
-    self.dummy_addr = int(self.iface.alloc(0x1000).va_addr)
+    self.dummy_buf = self.iface.alloc(0x1000)
+    self.dummy_addr = int(self.dummy_buf.va_addr)
     self.cmd_buf = self.iface.alloc(16 << 20)
     self.cmd_buf_allocator = BumpAllocator(size=self.cmd_buf.size, base=int(self.cmd_buf.va_addr), wrap=True)
     self.border_color_buf = self.iface.alloc(0x1000, fill_zeroes=True)

@@ -53,6 +53,7 @@ class RecordingMSMFile(FileIOInterface):
   def __init__(self):
     self.memory = (ctypes.c_ubyte * mmap.PAGESIZE)(*[0xaa] * mmap.PAGESIZE)
     self.cpu_addr, self.set_iova_errno, self.wait_errno = ctypes.addressof(self.memory), None, None
+    self.next_handle = 17
     self.news, self.unmaps, self.closed_handles = [], [], []
     self.submissions, self.waits = [], []
 
@@ -61,7 +62,7 @@ class RecordingMSMFile(FileIOInterface):
   def ioctl(self, request, arg):
     if request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
       self.news.append((arg.size, arg.flags))
-      arg.handle = 17
+      arg.handle, self.next_handle = self.next_handle, self.next_handle + 1
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_INFO):
       if arg.info == msm_drm.MSM_INFO_GET_OFFSET: arg.value = 0x8000
       elif arg.info == msm_drm.MSM_INFO_SET_IOVA and self.set_iova_errno is not None: raise OSError(self.set_iova_errno, "set iova failed")
@@ -91,7 +92,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
   def make_msm_iface(fd):
     from tinygrad.runtime.ops_qcom import MSMIface
     iface = object.__new__(MSMIface)
-    iface.dev, iface.fd, iface.queue_id = SimpleNamespace(last_cmd=0), fd, 3
+    iface.dev, iface.fd, iface.queue_id, iface.allocations = SimpleNamespace(last_cmd=0), fd, 3, {}
     return iface
 
   def test_bound_kgsl_submission_reuses_prepared_request(self):
@@ -112,26 +113,55 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
     ])
 
-  def test_msm_private_command_submission_is_reusable(self):
+  def test_msm_submission_includes_referenced_buffers_and_is_reusable(self):
     fd = RecordingMSMFile()
     iface = self.make_msm_iface(fd)
+    data = iface.alloc(0x100)
     command = iface.alloc(0x200, fill_zeroes=True).offset(0x40, 0x80)
-    prepared = iface.prepare_submit(command, command.size)
+    prepared = iface.prepare_submit(command, command.size, {data})
     self.assertEqual((iface.submit(prepared), iface.submit(prepared)), (1, 2))
 
-    private_flags = msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE
-    submit_flags = msm_drm.MSM_SUBMIT_BO_READ
-    self.assertEqual(fd.news, [(mmap.PAGESIZE, private_flags)])
+    submit_flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+    self.assertEqual(fd.news, [(mmap.PAGESIZE, msm_drm.MSM_BO_WC)] * 2)
     self.assertEqual(fd.submissions, [
-      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3, [(submit_flags, 17, fd.cpu_addr)],
+      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3,
+       [(submit_flags, 18, fd.cpu_addr), (submit_flags, 17, fd.cpu_addr)],
        [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
-      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3, [(submit_flags, 17, fd.cpu_addr)],
+      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3,
+       [(submit_flags, 18, fd.cpu_addr), (submit_flags, 17, fd.cpu_addr)],
        [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
     ])
     self.assertEqual(bytes(fd.memory[:0x200]), bytes(0x200))
     iface.free(command)
-    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
-    self.assertEqual(fd.closed_handles, [17])
+    iface.free(data)
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)] * 2)
+    self.assertEqual(fd.closed_handles, [18, 17])
+
+  def test_bound_msm_queue_prepares_referenced_buffers_once(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMSignal
+
+    class RecordingIface:
+      submit_requires_buffers = True
+      def __init__(self): self.prepared, self.submitted = [], []
+      def prepare_submit(self, command, size, buffers):
+        self.prepared.append((command, size, buffers))
+        return object()
+      def submit(self, prepared):
+        self.submitted.append(prepared)
+        return len(self.submitted)
+
+    allocator, iface = HostAllocator(), RecordingIface()
+    dummy = allocator.alloc(0x100, None)
+    dev = SimpleNamespace(iface=iface, allocator=allocator, dummy_buf=dummy, dummy_addr=dummy.va_addr, gpu_id=(6, 3, 0), last_cmd=0)
+    signal = QCOMSignal(base_buf=allocator.alloc(16, None))
+    queue = QCOMComputeQueue(dev).signal(signal, 1)
+    queue.bind(dev)
+    queue.submit(dev).submit(dev)
+
+    self.assertEqual(len(iface.prepared), 1)
+    self.assertEqual(iface.prepared[0][2], {dummy, signal.base_buf})
+    self.assertEqual(len(iface.submitted), 2)
+    self.assertIs(iface.submitted[0], iface.submitted[1])
 
   def test_msm_allocation_failure_releases_mapping_and_handle(self):
     fd = RecordingMSMFile()
