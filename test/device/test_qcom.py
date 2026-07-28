@@ -1,5 +1,6 @@
-import ctypes, platform, unittest
+import ctypes, errno, mmap, platform, unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 from tinygrad import Device
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime.autogen import kgsl, msm_drm
@@ -48,7 +49,51 @@ class RecordingKGSLFile(FileIOInterface):
     arg.timestamp = len(self.commands)
     return 0
 
+class RecordingMSMFile(FileIOInterface):
+  def __init__(self):
+    self.memory = (ctypes.c_ubyte * mmap.PAGESIZE)(*[0xaa] * mmap.PAGESIZE)
+    self.cpu_addr, self.set_iova_errno, self.wait_errno = ctypes.addressof(self.memory), None, None
+    self.news, self.unmaps, self.closed_handles = [], [], []
+    self.submissions, self.waits = [], []
+
+  def __del__(self): pass
+
+  def ioctl(self, request, arg):
+    if request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
+      self.news.append((arg.size, arg.flags))
+      arg.handle = 17
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_INFO):
+      if arg.info == msm_drm.MSM_INFO_GET_OFFSET: arg.value = 0x8000
+      elif arg.info == msm_drm.MSM_INFO_SET_IOVA and self.set_iova_errno is not None: raise OSError(self.set_iova_errno, "set iova failed")
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT):
+      bos = (msm_drm.struct_drm_msm_gem_submit_bo * arg.nr_bos).from_address(arg.bos)
+      cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * arg.nr_cmds).from_address(arg.cmds)
+      self.submissions.append((arg.bos, arg.cmds, arg.flags, arg.queueid,
+                               [(bo.flags, bo.handle, bo.presumed) for bo in bos],
+                               [(cmd.type, cmd.submit_idx, cmd.submit_offset, cmd.size) for cmd in cmds]))
+      arg.fence = len(self.submissions)
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE):
+      self.waits.append((arg.fence, arg.timeout.tv_sec, arg.timeout.tv_nsec, arg.queueid))
+      if self.wait_errno is not None: raise OSError(self.wait_errno, "wait failed")
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE): self.closed_handles.append(arg.handle)
+    else: raise AssertionError(f"unexpected ioctl {request:#x}")
+    return 0
+
+  def mmap(self, start, size, prot, flags, offset):
+    return self.cpu_addr
+
+  def munmap(self, addr, size):
+    self.unmaps.append((addr, size))
+    return 0
+
 class TestQCOMKernelInterfaces(unittest.TestCase):
+  @staticmethod
+  def make_msm_iface(fd):
+    from tinygrad.runtime.ops_qcom import MSMIface
+    iface = object.__new__(MSMIface)
+    iface.dev, iface.fd, iface.queue_id = SimpleNamespace(last_cmd=0), fd, 3
+    return iface
+
   def test_bound_kgsl_submission_reuses_prepared_request(self):
     from tinygrad.runtime.ops_qcom import KGSLIface, QCOMComputeQueue
 
@@ -66,6 +111,51 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
     ])
+
+  def test_msm_private_command_submission_is_reusable(self):
+    fd = RecordingMSMFile()
+    iface = self.make_msm_iface(fd)
+    command = iface.alloc(0x200, fill_zeroes=True).offset(0x40, 0x80)
+    prepared = iface.prepare_submit(command, command.size)
+    self.assertEqual((iface.submit(prepared), iface.submit(prepared)), (1, 2))
+
+    private_flags = msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE
+    submit_flags = msm_drm.MSM_SUBMIT_BO_READ
+    self.assertEqual(fd.news, [(mmap.PAGESIZE, private_flags)])
+    self.assertEqual(fd.submissions, [
+      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3, [(submit_flags, 17, fd.cpu_addr)],
+       [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
+      (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3, [(submit_flags, 17, fd.cpu_addr)],
+       [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
+    ])
+    self.assertEqual(bytes(fd.memory[:0x200]), bytes(0x200))
+    iface.free(command)
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    self.assertEqual(fd.closed_handles, [17])
+
+  def test_msm_allocation_failure_releases_mapping_and_handle(self):
+    fd = RecordingMSMFile()
+    fd.set_iova_errno = errno.EBUSY
+    with self.assertRaisesRegex(OSError, "set iova failed"): self.make_msm_iface(fd).alloc(17)
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    self.assertEqual(fd.closed_handles, [17])
+
+  def test_msm_fence_wait_tolerates_timeout_and_reports_driver_error(self):
+    from tinygrad.runtime.ops_qcom import MSM_WAIT_SLICE_NS
+
+    fd = RecordingMSMFile()
+    iface = self.make_msm_iface(fd)
+    iface.dev.last_cmd, fd.wait_errno = 41, errno.ETIMEDOUT
+    with patch("tinygrad.runtime.ops_qcom.time.monotonic_ns", return_value=5_000_000_123): iface.sleep(0)
+    deadline = 5_000_000_123 + MSM_WAIT_SLICE_NS
+    self.assertEqual(fd.waits, [(41, deadline // 1_000_000_000, deadline % 1_000_000_000, 3)])
+
+    fd.wait_errno = errno.EIO
+    with self.assertRaisesRegex(RuntimeError, "MSM fence wait failed"): iface.sleep(0)
+
+  def test_msm_rejects_external_pointer_mapping(self):
+    with self.assertRaisesRegex(RuntimeError, "external pointer"):
+      self.make_msm_iface(RecordingMSMFile()).map(0x1000, 0x1000)
 
 class TestQCOM(unittest.TestCase):
   # although part of the QCOM runtime, this tests flushing the CPU's dcache
