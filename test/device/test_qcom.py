@@ -1,7 +1,9 @@
 import ctypes, platform, unittest
+from types import SimpleNamespace
 from tinygrad import Device
 from tinygrad.renderer.cstyle import ClangRenderer
-from tinygrad.runtime.autogen import msm_drm
+from tinygrad.runtime.autogen import kgsl, msm_drm
+from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
 
 def ioctl_number(ioctl):
   direction, base, number, struct_type = ioctl.args
@@ -28,6 +30,42 @@ class TestMSMDRMUAPI(unittest.TestCase):
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM), 0xC0186440)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT), 0xC0486446)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE), 0x40206447)
+
+class HostAllocator:
+  def __init__(self): self.memories = []
+  def alloc(self, size, _options):
+    self.memories.append(memory:=(ctypes.c_ubyte * size)())
+    return HCQBuffer(addr:=ctypes.addressof(memory), size, view=MMIOInterface(addr, size))
+  def free(self, *_args): pass
+
+class RecordingKGSLFile(FileIOInterface):
+  def __init__(self): self.commands = []
+  def __del__(self): pass
+  def ioctl(self, request, arg):
+    if request != ioctl_number(kgsl.IOCTL_KGSL_GPU_COMMAND): raise AssertionError(f"unexpected ioctl {request:#x}")
+    obj = kgsl.struct_kgsl_command_object.from_address(arg.cmdlist)
+    self.commands.append((arg.cmdlist, arg.context_id, arg.cmdsize, obj.gpuaddr, obj.size, obj.flags))
+    arg.timestamp = len(self.commands)
+    return 0
+
+class TestQCOMKernelInterfaces(unittest.TestCase):
+  def test_bound_kgsl_submission_reuses_prepared_request(self):
+    from tinygrad.runtime.ops_qcom import KGSLIface, QCOMComputeQueue
+
+    fd, allocator = RecordingKGSLFile(), HostAllocator()
+    iface = object.__new__(KGSLIface)
+    iface.fd, iface.ctx = fd, 7
+    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    queue = QCOMComputeQueue(dev)
+    queue.q(0x12345678)
+    queue.bind(dev)
+    queue.submit(dev).submit(dev)
+
+    self.assertEqual(dev.last_cmd, 2)
+    self.assertEqual(fd.commands, [
+      (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
+      (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
+    ])
 
 class TestQCOM(unittest.TestCase):
   # although part of the QCOM runtime, this tests flushing the CPU's dcache
