@@ -1,11 +1,12 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, weakref, contextlib
+import os, ctypes, errno, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob
 assert sys.platform != 'win32'
+from dataclasses import dataclass
 from typing import Any, cast
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
-from tinygrad.runtime.autogen import kgsl, mesa
+from tinygrad.runtime.autogen import kgsl, mesa, msm_drm
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, ceildiv, prod, cpu_profile, lo32, suppress_finalizing, is_image_shape
@@ -15,6 +16,8 @@ from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
+# Slice fence waits so HCQSignal.wait retains progress tracking and its overall timeout.
+NS_PER_SEC, MSM_WAIT_SLICE_NS = 1_000_000_000, 1_000_000
 
 @functools.cache
 def dcache_flush():
@@ -409,8 +412,108 @@ class KGSLIface:
 
   def device_fini(self): pass
 
+@dataclass
+class MSMAllocation:
+  handle: int
+  iova: int
+  mapped_size: int
+
+def _open_msm_render_node(path:str) -> FileIOInterface|None:
+  try: fd = FileIOInterface(path, os.O_RDWR)
+  except OSError: return None
+  try: msm_drm.DRM_IOCTL_MSM_GET_PARAM(fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_GPU_ID)
+  except OSError:
+    os.close(fd.fd)
+    del fd.fd
+    return None
+  return fd
+
+class MSMIface:
+  count = 1
+  renderers = [IR3Renderer]
+
+  def __init__(self, dev:QCOMDevice, device_id:int):
+    if device_id != 0: raise RuntimeError(f"QCOM:{device_id} does not exist (1 MSM DRM device available)")
+    self.dev = dev
+    for path in sorted(glob.glob("/dev/dri/renderD*")):
+      if (fd:=_open_msm_render_node(path)) is not None:
+        self.fd = fd
+        break
+    else: raise RuntimeError("No MSM DRM render node found")
+
+    self.chip_id = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID).value
+    self.gpu_id = (self.chip_id >> 24, (self.chip_id >> 16) & 0xff, (self.chip_id >> 8) & 0xff)
+    if self.gpu_id != (6, 3, 0): raise RuntimeError(f"MSM DRM requires Adreno 630, got chip_id={self.chip_id:#x}")
+    self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
+
+  def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
+    if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
+    mapped_size = round_up(size, mmap.PAGESIZE)
+    flags = msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=flags)
+    cpu_addr = None
+    try:
+      offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
+      cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
+      msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_SET_IOVA, value=cpu_addr)
+    except Exception as e:
+      cleanup_error = RuntimeError(f"Failed to unmap MSM GEM handle {gem.handle}") \
+        if cpu_addr is not None and self.fd.munmap(cpu_addr, mapped_size) != 0 else None
+      try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=gem.handle)
+      except OSError as close_error: raise RuntimeError(f"Failed to close MSM GEM handle {gem.handle} during allocation cleanup") from close_error
+      if cleanup_error is not None: raise cleanup_error from e
+      raise
+
+    if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
+    allocation = MSMAllocation(gem.handle, cpu_addr, mapped_size)
+    return HCQBuffer(cpu_addr, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
+
+  def map(self, _ptr:int, _size:int) -> HCQBuffer: raise RuntimeError("MSM DRM does not support external pointer mapping")
+
+  def free(self, mem:HCQBuffer):
+    if not isinstance(allocation:=mem.base.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    unmap_error = self.fd.munmap(allocation.iova, allocation.mapped_size) != 0
+    try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
+    except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
+    if unmap_error: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
+
+  def prepare_submit(self, command:HCQBuffer, size:int):
+    if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
+    if not isinstance(allocation:=command.base.meta, MSMAllocation):
+      raise RuntimeError("MSM command buffer was not allocated by the MSM DRM interface")
+    command_offset = int(command.va_addr) - allocation.iova
+    if command_offset < 0 or size > command.size or command_offset + size > allocation.mapped_size:
+      raise ValueError("MSM command range is outside its buffer")
+
+    bos = (msm_drm.struct_drm_msm_gem_submit_bo * 1)(
+      msm_drm.struct_drm_msm_gem_submit_bo(flags=msm_drm.MSM_SUBMIT_BO_READ, handle=allocation.handle, presumed=allocation.iova))
+    cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(
+      msm_drm.struct_drm_msm_gem_submit_cmd(type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
+    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=1, nr_cmds=1,
+                                               bos=ctypes.addressof(bos), cmds=ctypes.addressof(cmds), queueid=self.queue_id)
+    return submit, bos, cmds
+
+  def submit(self, prepared) -> int:
+    msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
+    return prepared[0].fence
+
+  def sleep(self, _time_spent_since_last_sleep_ms:int):
+    if self.dev.last_cmd == 0: return
+    tv_sec, tv_nsec = divmod(time.monotonic_ns() + MSM_WAIT_SLICE_NS, NS_PER_SEC)
+    timeout = msm_drm.struct_drm_msm_timespec(tv_sec=tv_sec, tv_nsec=tv_nsec)
+    try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=self.dev.last_cmd, flags=0, timeout=timeout, queueid=self.queue_id)
+    except OSError as e:
+      if e.errno not in {errno.EINTR, errno.ETIMEDOUT}: raise RuntimeError("MSM fence wait failed") from e
+
+  def profile_finalize(self): pass
+
+  def device_fini(self):
+    if (queue_id:=getattr(self, "queue_id", None)) is None: return
+    msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, queue_id)
+    self.queue_id = None
+
 class QCOMDevice(HCQCompiled):
-  ifaces = [KGSLIface]
+  ifaces = [KGSLIface, MSMIface]
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0

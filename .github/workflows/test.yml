@@ -792,6 +792,9 @@ jobs:
       - name: Set env
         shell: bash
         run: printf "NULL_ALLOW_COPYOUT=1\n${{ matrix.backend == 'ir3' && 'DEV=NULL:IR3:a630' || matrix.backend == 'nak' && 'DEV=NULL:NAK:sm_120' }}" >> $GITHUB_ENV
+      - name: Test QCOM kernel interfaces
+        if: matrix.backend == 'ir3'
+        run: python -m pytest test/device/test_qcom.py::TestMSMDRMUAPI test/device/test_qcom.py::TestQCOMKernelInterfaces
       - name: Run test_ops
         shell: bash
         run: |
