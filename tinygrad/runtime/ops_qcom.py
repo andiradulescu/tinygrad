@@ -504,11 +504,10 @@ class MSMIface:
   def free(self, mem:HCQBuffer):
     if not isinstance(allocation:=mem.base.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
     if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
-    unmap_error = self.fd.munmap(allocation.iova, allocation.mapped_size) != 0
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
-    if unmap_error: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
     self.allocations.pop(allocation.handle)
+    if self.fd.munmap(allocation.iova, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
     if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation

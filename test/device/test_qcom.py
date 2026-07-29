@@ -52,7 +52,8 @@ class RecordingKGSLFile(FileIOInterface):
 class RecordingMSMFile(FileIOInterface):
   def __init__(self):
     self.memory = (ctypes.c_ubyte * mmap.PAGESIZE)(*[0xaa] * mmap.PAGESIZE)
-    self.cpu_addr, self.set_iova_errno, self.wait_errno = ctypes.addressof(self.memory), None, None
+    self.cpu_addr, self.set_iova_errno, self.wait_errno, self.close_errno = ctypes.addressof(self.memory), None, None, None
+    self.unmap_result = 0
     self.next_handle = 17
     self.news, self.unmaps, self.closed_handles = [], [], []
     self.submissions, self.waits = [], []
@@ -76,7 +77,9 @@ class RecordingMSMFile(FileIOInterface):
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE):
       self.waits.append((arg.fence, arg.timeout.tv_sec, arg.timeout.tv_nsec, arg.queueid))
       if self.wait_errno is not None: raise OSError(self.wait_errno, "wait failed")
-    elif request == ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE): self.closed_handles.append(arg.handle)
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE):
+      if self.close_errno is not None: raise OSError(self.close_errno, "close failed")
+      self.closed_handles.append(arg.handle)
     else: raise AssertionError(f"unexpected ioctl {request:#x}")
     return 0
 
@@ -85,7 +88,7 @@ class RecordingMSMFile(FileIOInterface):
 
   def munmap(self, addr, size):
     self.unmaps.append((addr, size))
-    return 0
+    return self.unmap_result
 
 class TestQCOMKernelInterfaces(unittest.TestCase):
   @staticmethod
@@ -169,6 +172,21 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     with self.assertRaisesRegex(OSError, "set iova failed"): self.make_msm_iface(fd).alloc(17)
     self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
     self.assertEqual(fd.closed_handles, [17])
+
+  def test_msm_free_failure_keeps_allocation_state_consistent(self):
+    fd = RecordingMSMFile()
+    iface = self.make_msm_iface(fd)
+    buf = iface.alloc(17)
+
+    fd.close_errno = errno.EIO
+    with self.assertRaisesRegex(RuntimeError, "Failed to close"): iface.free(buf)
+    self.assertIs(iface.allocations[buf.meta.handle], buf.meta)
+    self.assertEqual(fd.unmaps, [])
+
+    fd.close_errno, fd.unmap_result = None, -1
+    with self.assertRaisesRegex(RuntimeError, "Failed to unmap"): iface.free(buf)
+    self.assertNotIn(buf.meta.handle, iface.allocations)
+    self.assertEqual(fd.closed_handles, [buf.meta.handle])
 
   def test_msm_fence_wait_tolerates_timeout_and_reports_driver_error(self):
     from tinygrad.runtime.ops_qcom import MSM_WAIT_SLICE_NS
