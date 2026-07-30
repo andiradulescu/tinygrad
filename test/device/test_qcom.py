@@ -1,10 +1,13 @@
-import ctypes, errno, mmap, platform, unittest
+import ctypes, errno, itertools, mmap, platform, struct, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from tinygrad import Device
+from tinygrad.device import TinyELF
+from tinygrad.dtype import dtypes
+from tinygrad.helpers import Target
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime.autogen import kgsl, msm_drm
-from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
+from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, HWQueue, MMIOInterface
 
 def ioctl_number(ioctl):
   direction, base, number, struct_type = ioctl.args
@@ -39,6 +42,14 @@ class HostAllocator:
     return HCQBuffer(addr:=ctypes.addressof(memory), size, view=MMIOInterface(addr, size))
   def free(self, *_args): pass
 
+class SplitAddressAllocator:
+  def __init__(self): self.memories = []
+  def alloc(self, size, _options):
+    gpu_memory, cpu_memory = (ctypes.c_ubyte * size)(*[0xaa] * size), (ctypes.c_ubyte * size)(*[0xaa] * size)
+    self.memories.append((gpu_memory, cpu_memory))
+    return HCQBuffer(ctypes.addressof(gpu_memory), size, view=MMIOInterface(ctypes.addressof(cpu_memory), size))
+  def free(self, *_args): pass
+
 class RecordingKGSLFile(FileIOInterface):
   def __init__(self): self.commands = []
   def __del__(self): pass
@@ -52,21 +63,27 @@ class RecordingKGSLFile(FileIOInterface):
 class RecordingMSMFile(FileIOInterface):
   def __init__(self):
     self.memory = (ctypes.c_ubyte * mmap.PAGESIZE)(*[0xaa] * mmap.PAGESIZE)
-    self.cpu_addr, self.set_iova_errno, self.wait_errno, self.close_errno = ctypes.addressof(self.memory), None, None, None
+    self.cpu_addr, self.get_iova_errno, self.wait_errno, self.close_errno = ctypes.addressof(self.memory), None, None, None
     self.unmap_result = 0
     self.next_handle = 17
-    self.news, self.unmaps, self.closed_handles = [], [], []
+    self.news, self.infos, self.unmaps, self.closed_handles = [], [], [], []
     self.submissions, self.waits = [], []
 
   def __del__(self): pass
+  @staticmethod
+  def iova(handle): return 0x10000000 + handle * mmap.PAGESIZE
 
   def ioctl(self, request, arg):
     if request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
       self.news.append((arg.size, arg.flags))
       arg.handle, self.next_handle = self.next_handle, self.next_handle + 1
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_INFO):
+      self.infos.append((arg.handle, arg.info, arg.value))
       if arg.info == msm_drm.MSM_INFO_GET_OFFSET: arg.value = 0x8000
-      elif arg.info == msm_drm.MSM_INFO_SET_IOVA and self.set_iova_errno is not None: raise OSError(self.set_iova_errno, "set iova failed")
+      elif arg.info == msm_drm.MSM_INFO_GET_IOVA:
+        if self.get_iova_errno is not None: raise OSError(self.get_iova_errno, "get iova failed")
+        arg.value = self.iova(arg.handle)
+      elif arg.info == msm_drm.MSM_INFO_SET_IOVA: raise AssertionError("MSM allocations must use the driver-assigned IOVA")
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT):
       bos = (msm_drm.struct_drm_msm_gem_submit_bo * arg.nr_bos).from_address(arg.bos)
       cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * arg.nr_cmds).from_address(arg.cmds)
@@ -116,6 +133,78 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
     ])
 
+  def test_bound_queue_writes_commands_through_cpu_mapping(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue
+
+    allocator = SplitAddressAllocator()
+    iface = SimpleNamespace(submit_requires_buffers=False, prepare_submit=lambda *_args: object())
+    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    queue = QCOMComputeQueue(dev)
+    queue.q(0x12345678, 0x9abcdef0)
+    queue.bind(dev)
+
+    gpu_memory, cpu_memory = allocator.memories[0]
+    self.assertEqual(list(cpu_memory), list(bytes.fromhex("78563412f0debc9a")))
+    self.assertEqual(list(gpu_memory), [0xaa] * 8)
+
+  def test_kernel_arguments_use_cpu_mapping(self):
+    from tinygrad.runtime.ops_qcom import QCOMArgsState
+
+    gpu_memory, cpu_memory = (ctypes.c_ubyte * 64)(*[0xaa] * 64), (ctypes.c_ubyte * 64)(*[0xaa] * 64)
+    args = HCQBuffer(ctypes.addressof(gpu_memory), 64, view=MMIOInterface(ctypes.addressof(cpu_memory), 64))
+    data = HCQBuffer(0x123456789abcdef0, 16)
+    signature = ((None, 0, dtypes.float32, (1,)), (None, 1, dtypes.uint32, ()))
+    prg = SimpleNamespace(kernargs_alloc_size=64, signature=signature, ibo_cnt=0, tex_cnt=0, samp_cnt=0, NIR=True,
+                          tex_to_image=[], consts_info=[(0x12345678, 24, 4)], buf_off=8, tex_off=64, ibo_off=64, samplers=[])
+
+    state = QCOMArgsState(args, prg, (data,), vals=(0x87654321,))
+    HWQueue().bind_args_state(state)
+
+    self.assertEqual(bytes(cpu_memory[:8]), bytes(8))
+    self.assertEqual(int.from_bytes(cpu_memory[8:16], "little"), data.va_addr)
+    self.assertEqual(int.from_bytes(cpu_memory[16:20], "little"), 0x87654321)
+    self.assertEqual(int.from_bytes(cpu_memory[24:28], "little"), 0x12345678)
+    self.assertEqual(bytes(cpu_memory[28:]), bytes(36))
+    self.assertEqual(bytes(gpu_memory), bytes([0xaa] * 64))
+
+  def test_program_upload_uses_cpu_mapping(self):
+    from tinygrad.runtime.ops_qcom import QCOMProgram
+
+    lib, image, image_offset, image_desc_offset, reg_desc_offset = bytearray(0x500), b"\x12\x34\x56\x78", 0x400, 0x180, 0x300
+    struct.pack_into("I", lib, 0x100, len(image))
+    struct.pack_into("I", lib, 0xc0, image_offset)
+    struct.pack_into("I", lib, 0x110, image_desc_offset)
+    struct.pack_into("I", lib, 0x34, reg_desc_offset)
+    struct.pack_into("I", lib, reg_desc_offset + 0x14, 1)
+    lib[image_offset:image_offset+len(image)] = image
+
+    allocator = SplitAddressAllocator()
+    dev = SimpleNamespace(device="QCOM", renderer=object(), allocator=allocator, prof_prg_counter=itertools.count(),
+                          _ensure_stack_size=lambda _size: None)
+    QCOMProgram(dev, TinyELF(bytes(lib), "test", Target("QCOM"), ()))
+
+    gpu_memory, cpu_memory = allocator.memories[0]
+    self.assertEqual(bytes(cpu_memory), image)
+    self.assertEqual(bytes(gpu_memory), bytes([0xaa] * len(image)))
+
+  def test_workgroup_size_uses_cpu_mapping(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue
+
+    gpu_memory, cpu_memory = (ctypes.c_ubyte * 32)(*[0xaa] * 32), (ctypes.c_ubyte * 32)(*[0xaa] * 32)
+    args = HCQBuffer(ctypes.addressof(gpu_memory), 32, view=MMIOInterface(ctypes.addressof(cpu_memory), 32))
+    prg = SimpleNamespace(NIR=True, wgsz=1, hregs=0, fregs=0, brnchstck=0, shared_size=1, prg_offset=0,
+                          lib_gpu=HCQBuffer(0x200000, 128), pvtmem_size_per_item=0, pvtmem_size_total=0, hw_stack_offset=0,
+                          image_size=128, samp_cnt=0, tex_cnt=0, ibo_cnt=0, wgid=0xfc, lid=0xfc)
+    dummy = HCQBuffer(0x300000, 4096)
+    dev = SimpleNamespace(iface=SimpleNamespace(submit_requires_buffers=False), gpu_id=(6, 0, 0), dummy_buf=dummy, dummy_addr=dummy.va_addr,
+                          _stack=HCQBuffer(0x400000, 4096), border_color_buf=HCQBuffer(0x500000, 4096))
+    prg.dev = dev
+
+    QCOMComputeQueue(dev).exec(prg, SimpleNamespace(bind_data=[], buf=args, prg=prg, bufs=()), (1, 1, 1), (2, 3, 4))
+
+    self.assertEqual(bytes(cpu_memory[4:16]), struct.pack("III", 2, 3, 4))
+    self.assertEqual(bytes(gpu_memory), bytes([0xaa] * len(gpu_memory)))
+
   def test_msm_submission_includes_referenced_buffers_and_is_reusable(self):
     fd = RecordingMSMFile()
     iface = self.make_msm_iface(fd)
@@ -125,13 +214,15 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertEqual((iface.submit(prepared), iface.submit(prepared)), (1, 2))
 
     submit_flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+    self.assertEqual((data.va_addr, data.cpu_view().addr), (fd.iova(17), fd.cpu_addr))
+    self.assertEqual((command.va_addr, command.cpu_view().addr), (fd.iova(18) + 0x40, fd.cpu_addr + 0x40))
     self.assertEqual(fd.news, [(mmap.PAGESIZE, msm_drm.MSM_BO_WC)] * 2)
     self.assertEqual(fd.submissions, [
       (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3,
-       [(submit_flags, 18, fd.cpu_addr), (submit_flags, 17, fd.cpu_addr)],
+       [(submit_flags, 18, fd.iova(18)), (submit_flags, 17, fd.iova(17))],
        [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
       (fd.submissions[0][0], fd.submissions[0][1], msm_drm.MSM_PIPE_3D0, 3,
-       [(submit_flags, 18, fd.cpu_addr), (submit_flags, 17, fd.cpu_addr)],
+       [(submit_flags, 18, fd.iova(18)), (submit_flags, 17, fd.iova(17))],
        [(msm_drm.MSM_SUBMIT_CMD_BUF, 0, 0x40, 0x80)]),
     ])
     self.assertEqual(bytes(fd.memory[:0x200]), bytes(0x200))
@@ -168,9 +259,9 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
   def test_msm_allocation_failure_releases_mapping_and_handle(self):
     fd = RecordingMSMFile()
-    fd.set_iova_errno = errno.EBUSY
-    with self.assertRaisesRegex(OSError, "set iova failed"): self.make_msm_iface(fd).alloc(17)
-    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    fd.get_iova_errno = errno.EBUSY
+    with self.assertRaisesRegex(OSError, "get iova failed"): self.make_msm_iface(fd).alloc(17)
+    self.assertEqual(fd.unmaps, [])
     self.assertEqual(fd.closed_handles, [17])
 
   def test_msm_free_failure_keeps_allocation_state_consistent(self):

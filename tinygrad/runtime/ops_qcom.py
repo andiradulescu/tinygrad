@@ -131,7 +131,6 @@ class QCOMComputeQueue(HWQueue):
       hw_page = dev.cmd_buf.offset(int(hw_addr - dev.cmd_buf.va_addr), size)
     hw_page.cpu_view().view(size=size, fmt='I')[:] = array.array('I', self._q)
     return hw_page
-
   def bind(self, dev:QCOMDevice):
     self.binded_device = dev
     self.hw_page = self._build_gpu_command(dev, dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True)))
@@ -446,6 +445,7 @@ class MSMAllocation:
   handle: int
   iova: int
   mapped_size: int
+  cpu_addr: int
 
 def _open_msm_render_node(path:str) -> FileIOInterface|None:
   try: fd = FileIOInterface(path, os.O_RDWR)
@@ -483,9 +483,9 @@ class MSMIface:
     gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
     cpu_addr = None
     try:
+      iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
       cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
-      msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_SET_IOVA, value=cpu_addr)
     except Exception as e:
       cleanup_error = RuntimeError(f"Failed to unmap MSM GEM handle {gem.handle}") \
         if cpu_addr is not None and self.fd.munmap(cpu_addr, mapped_size) != 0 else None
@@ -495,9 +495,9 @@ class MSMIface:
       raise
 
     if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
-    allocation = MSMAllocation(gem.handle, cpu_addr, mapped_size)
+    allocation = MSMAllocation(gem.handle, iova, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
-    return HCQBuffer(cpu_addr, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
+    return HCQBuffer(iova, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
 
   def map(self, _ptr:int, _size:int) -> HCQBuffer: raise RuntimeError("MSM DRM does not support external pointer mapping")
 
@@ -507,7 +507,7 @@ class MSMIface:
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     self.allocations.pop(allocation.handle)
-    if self.fd.munmap(allocation.iova, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
+    if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
     if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation
