@@ -315,18 +315,13 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertEqual(iface.allocation_generation, 1)
     self.assertEqual(fd.closed_handles, [buf.meta.handle])
 
-  def test_msm_fence_wait_tolerates_timeout_and_reports_driver_error(self):
-    from tinygrad.runtime.ops_qcom import MSM_WAIT_SLICE_NS
+  def test_msm_signal_wait_sleeps_between_polls(self):
+    from tinygrad.runtime.ops_qcom import MSM_SIGNAL_POLL_SECONDS
 
-    fd = RecordingMSMFile()
-    iface = self.make_msm_iface(fd)
-    iface.dev.last_cmd, fd.wait_errno = 41, errno.ETIMEDOUT
-    with patch("tinygrad.runtime.ops_qcom.time.monotonic_ns", return_value=5_000_000_123): iface.sleep(0)
-    deadline = 5_000_000_123 + MSM_WAIT_SLICE_NS
-    self.assertEqual(fd.waits, [(41, deadline // 1_000_000_000, deadline % 1_000_000_000, 3)])
-
-    fd.wait_errno = errno.EIO
-    with self.assertRaisesRegex(RuntimeError, "MSM fence wait failed"): iface.sleep(0)
+    iface = self.make_msm_iface(RecordingMSMFile())
+    with patch("tinygrad.runtime.ops_qcom.time.sleep") as sleep:
+      iface.sleep(0)
+    sleep.assert_called_once_with(MSM_SIGNAL_POLL_SECONDS)
 
   def test_msm_rejects_external_pointer_mapping(self):
     with self.assertRaisesRegex(RuntimeError, "external pointer"):

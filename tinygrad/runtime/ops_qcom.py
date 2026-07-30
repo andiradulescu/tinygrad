@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, errno, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob
+import os, ctypes, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from typing import Any
@@ -16,8 +16,8 @@ from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
-# Slice fence waits so HCQSignal.wait retains progress tracking and its overall timeout.
-NS_PER_SEC, MSM_WAIT_SLICE_NS = 1_000_000_000, 1_000_000
+# Poll the userspace timeline without busy-spinning or waiting for the later kernel submission fence.
+MSM_SIGNAL_POLL_SECONDS = 0.0001
 
 @functools.cache
 def dcache_flush():
@@ -552,12 +552,7 @@ class MSMIface:
     return prepared[0].fence
 
   def sleep(self, _time_spent_since_last_sleep_ms:int):
-    if self.dev.last_cmd == 0: return
-    tv_sec, tv_nsec = divmod(time.monotonic_ns() + MSM_WAIT_SLICE_NS, NS_PER_SEC)
-    timeout = msm_drm.struct_drm_msm_timespec(tv_sec=tv_sec, tv_nsec=tv_nsec)
-    try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=self.dev.last_cmd, flags=0, timeout=timeout, queueid=self.queue_id)
-    except OSError as e:
-      if e.errno not in {errno.EINTR, errno.ETIMEDOUT}: raise RuntimeError("MSM fence wait failed") from e
+    time.sleep(MSM_SIGNAL_POLL_SECONDS)
 
   def profile_finalize(self): pass
 
