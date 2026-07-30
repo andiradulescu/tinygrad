@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, ctypes, errno, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob
 assert sys.platform != 'win32'
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
@@ -128,7 +128,7 @@ class QCOMComputeQueue(HWQueue):
     if hw_page is None:
       hw_page_addr = dev.cmd_buf_allocator.alloc(len(self._q) * 4)
       hw_page = dev.cmd_buf.offset(offset=int(hw_page_addr - dev.cmd_buf.va_addr), size=len(self._q) * 4)
-    to_mv(int(hw_page.va_addr), len(self._q) * 4).cast('I')[:] = array.array('I', self._q)
+    hw_page.cpu_view().view(size=len(self._q) * 4, fmt='I')[:] = array.array('I', self._q)
     return hw_page
 
   def bind(self, dev:QCOMDevice):
@@ -137,7 +137,7 @@ class QCOMComputeQueue(HWQueue):
     self.prepared_submit = None if self._buffers is not None and any(x is not None for x in self._buffers.values()) \
       else dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
     # From now on, the queue is on the device for faster submission.
-    self._q = to_mv(int(self.hw_page.va_addr), len(self._q) * 4).cast("I")
+    self._q = self.hw_page.cpu_view().view(size=len(self._q) * 4, fmt='I')
 
   def _submit(self, dev:QCOMDevice):
     prepared = self.prepared_submit if self.binded_device == dev and self.prepared_submit is not None \
@@ -177,7 +177,8 @@ class QCOMComputeQueue(HWQueue):
              qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=prg.pvtmem_size_per_item), *data64_le(prg.dev._stack.va_addr),
              qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=prg.pvtmem_size_total))
 
-    if prg.NIR and prg.wgsz != 0xfc: to_mv(int(args_state.buf.va_addr) + prg.wgsz * 4, 12)[:] = struct.pack("III", *local_size)
+    if prg.NIR and prg.wgsz != 0xfc:
+      args_state.buf.cpu_view().view(offset=prg.wgsz * 4, size=12, fmt='B')[:] = struct.pack("III", *local_size)
     self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
                                                              state_block=mesa.SB6_CS_SHADER, num_unit=1024 // 4),
              *data64_le(args_state.buf.va_addr))
@@ -228,16 +229,17 @@ class QCOMComputeQueue(HWQueue):
 class QCOMArgsState(HCQArgsState):
   def __init__(self, buf:HCQBuffer, prg:QCOMProgram, bufs:tuple[HCQBuffer, ...], vals:tuple[int, ...]=()):
     super().__init__(buf, prg, bufs, vals=vals)
-    ctypes.memset(int(self.buf.va_addr), 0, prg.kernargs_alloc_size)
+    self.buf.cpu_view().view(size=prg.kernargs_alloc_size, fmt='B')[:] = bytes(prg.kernargs_alloc_size)
 
     ubos = [bufs[slot] for _,slot,_,shape in prg.signature if slot < len(bufs) and not is_image_shape(shape)]
     uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in prg.signature if slot < len(bufs) and is_image_shape(shape)]
     # NIR can reorder images to different texture slots
     ibos, texs = uavs[:prg.ibo_cnt], [uavs[prg.ibo_cnt + (prg.tex_to_image[i] if prg.NIR else i)] for i in range(prg.tex_cnt)]
     for cnst_val,cnst_off,cnst_sz in prg.consts_info:
-      to_mv(cast(int, self.buf.va_addr) + cnst_off, cnst_sz)[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
+      self.buf.cpu_view().view(offset=cnst_off, size=cnst_sz, fmt='B')[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
 
-    if prg.samp_cnt > 0: to_mv(int(self.buf.va_addr) + prg.samp_off, len(prg.samplers) * 4).cast('I')[:] = array.array('I', prg.samplers)
+    if prg.samp_cnt > 0:
+      self.buf.cpu_view().view(offset=prg.samp_off, size=len(prg.samplers) * 4, fmt='I')[:] = array.array('I', prg.samplers)
     if prg.NIR:
       self.bind_sints_to_buf(*[b.va_addr for b in ubos], buf=self.buf, fmt='Q', offset=prg.buf_off)
       for v,(o,dt) in zip(vals, TinyELF.iter_sig(prg.signature[len(bufs):], len(ubos)*8)):
@@ -287,7 +289,7 @@ class QCOMProgram(HCQProgram['QCOMDevice']):
     else: self._parse_lib(obj.lib)
 
     self.lib_gpu: HCQBuffer = self.dev.allocator.alloc(self.image_size, buf_spec:=BufferSpec(cpu_access=True, nolru=True))
-    to_mv(self.lib_gpu.va_addr, self.image_size)[:] = self.image
+    self.lib_gpu.cpu_view().view(size=self.image_size, fmt='B')[:] = self.image
 
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
     self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
@@ -445,6 +447,7 @@ class MSMAllocation:
   handle: int
   iova: int
   mapped_size: int
+  cpu_addr: int
 
 def _open_msm_render_node(path:str) -> FileIOInterface|None:
   try: fd = FileIOInterface(path, os.O_RDWR)
@@ -482,9 +485,9 @@ class MSMIface:
     gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
     cpu_addr = None
     try:
+      iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
       cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
-      msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_SET_IOVA, value=cpu_addr)
     except Exception as e:
       cleanup_error = RuntimeError(f"Failed to unmap MSM GEM handle {gem.handle}") \
         if cpu_addr is not None and self.fd.munmap(cpu_addr, mapped_size) != 0 else None
@@ -494,9 +497,9 @@ class MSMIface:
       raise
 
     if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
-    allocation = MSMAllocation(gem.handle, cpu_addr, mapped_size)
+    allocation = MSMAllocation(gem.handle, iova, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
-    return HCQBuffer(cpu_addr, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
+    return HCQBuffer(iova, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
 
   def map(self, _ptr:int, _size:int) -> HCQBuffer: raise RuntimeError("MSM DRM does not support external pointer mapping")
 
@@ -506,7 +509,7 @@ class MSMIface:
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     self.allocations.pop(allocation.handle)
-    if self.fd.munmap(allocation.iova, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
+    if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
     if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation
