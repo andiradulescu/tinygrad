@@ -112,7 +112,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
   def make_msm_iface(fd):
     from tinygrad.runtime.ops_qcom import MSMIface
     iface = object.__new__(MSMIface)
-    iface.dev, iface.fd, iface.queue_id, iface.allocations = SimpleNamespace(last_cmd=0), fd, 3, {}
+    iface.dev, iface.fd, iface.queue_id, iface.allocations, iface.allocation_generation = SimpleNamespace(last_cmd=0), fd, 3, {}, 0
     return iface
 
   def test_bound_kgsl_submission_reuses_prepared_request(self):
@@ -236,7 +236,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
     class RecordingIface:
       submit_requires_buffers = True
-      def __init__(self): self.prepared, self.submitted = [], []
+      def __init__(self): self.prepared, self.submitted, self.allocation_generation = [], [], 0
       def prepare_submit(self, command, size, buffers):
         self.prepared.append((command, size, buffers))
         return object()
@@ -257,6 +257,40 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertEqual(len(iface.submitted), 2)
     self.assertIs(iface.submitted[0], iface.submitted[1])
 
+  def test_bound_msm_queue_reprepares_only_when_symbolic_buffers_or_allocations_change(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue
+    from tinygrad.uop.ops import UOp
+
+    class RecordingIface:
+      submit_requires_buffers = True
+      def __init__(self): self.prepared, self.submitted, self.allocation_generation = [], [], 0
+      def prepare_submit(self, command, size, buffers):
+        self.prepared.append((command, size, sorted((buf.va_addr, buf.size) for buf in buffers)))
+        return object()
+      def submit(self, prepared):
+        self.submitted.append(prepared)
+        return len(self.submitted)
+
+    allocator, iface = HostAllocator(), RecordingIface()
+    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    queue = QCOMComputeQueue(dev)
+    queue.q(0x12345678)
+    queue._add_buffers(HCQBuffer(UOp.variable("address", 0, 2**64-1, dtypes.uint64), 0x100))
+    queue.bind(dev)
+
+    queue.submit(dev, {"address":0x100000}).submit(dev, {"address":0x100000})
+    self.assertEqual(len(iface.prepared), 1)
+    self.assertIs(iface.submitted[0], iface.submitted[1])
+
+    queue.submit(dev, {"address":0x200000})
+    self.assertEqual(len(iface.prepared), 2)
+    self.assertIsNot(iface.submitted[1], iface.submitted[2])
+
+    iface.allocation_generation += 1
+    queue.submit(dev, {"address":0x200000})
+    self.assertEqual(len(iface.prepared), 3)
+    self.assertIsNot(iface.submitted[2], iface.submitted[3])
+
   def test_msm_allocation_failure_releases_mapping_and_handle(self):
     fd = RecordingMSMFile()
     fd.get_iova_errno = errno.EBUSY
@@ -272,11 +306,13 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     fd.close_errno = errno.EIO
     with self.assertRaisesRegex(RuntimeError, "Failed to close"): iface.free(buf)
     self.assertIs(iface.allocations[buf.meta.handle], buf.meta)
+    self.assertEqual(iface.allocation_generation, 0)
     self.assertEqual(fd.unmaps, [])
 
     fd.close_errno, fd.unmap_result = None, -1
     with self.assertRaisesRegex(RuntimeError, "Failed to unmap"): iface.free(buf)
     self.assertNotIn(buf.meta.handle, iface.allocations)
+    self.assertEqual(iface.allocation_generation, 1)
     self.assertEqual(fd.closed_handles, [buf.meta.handle])
 
   def test_msm_fence_wait_tolerates_timeout_and_reports_driver_error(self):
