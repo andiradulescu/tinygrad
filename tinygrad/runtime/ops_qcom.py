@@ -88,6 +88,10 @@ class QCOMComputeQueue(HWQueue):
       else: buffers.add(HCQBuffer(address, buf.size))
     return buffers
 
+  def _submit_key(self, dev:QCOMDevice):
+    if self._buffers is None: return None
+    return dev.iface.allocation_generation, tuple(self._prev_resolved_syms[x] for x in self._buffers.values() if x is not None)
+
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
     # TODO: 7xx support.
     if write_back:
@@ -136,13 +140,18 @@ class QCOMComputeQueue(HWQueue):
     self.hw_page = self._build_gpu_command(dev, dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True)))
     self.prepared_submit = None if self._buffers is not None and any(x is not None for x in self._buffers.values()) \
       else dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
+    self.prepared_submit_key = None if self.prepared_submit is None else self._submit_key(dev)
     # From now on, the queue is on the device for faster submission.
     self._q = self.hw_page.cpu_view().view(size=len(self._q) * 4, fmt='I')
 
   def _submit(self, dev:QCOMDevice):
-    prepared = self.prepared_submit if self.binded_device == dev and self.prepared_submit is not None \
-      else dev.iface.prepare_submit(self.hw_page if self.binded_device == dev else self._build_gpu_command(dev),
-                                    len(self._q) * 4, self._resolve_submit_buffers())
+    if self.binded_device == dev:
+      submit_key = self._submit_key(dev)
+      if self.prepared_submit is None or self.prepared_submit_key != submit_key:
+        self.prepared_submit = dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
+        self.prepared_submit_key = submit_key
+      prepared = self.prepared_submit
+    else: prepared = dev.iface.prepare_submit(self._build_gpu_command(dev), len(self._q) * 4, self._resolve_submit_buffers())
     dev.last_cmd = dev.iface.submit(prepared)
 
   def exec(self, prg:QCOMProgram, args_state:QCOMArgsState, global_size, local_size):
@@ -478,6 +487,7 @@ class MSMIface:
     if self.gpu_id != (6, 3, 0): raise RuntimeError(f"MSM DRM requires Adreno 630, got chip_id={self.chip_id:#x}")
     self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
     self.allocations:dict[int, MSMAllocation] = {}
+    self.allocation_generation = 0
 
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
@@ -509,6 +519,7 @@ class MSMIface:
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     self.allocations.pop(allocation.handle)
+    self.allocation_generation += 1
     if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
