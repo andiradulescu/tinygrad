@@ -238,7 +238,7 @@ class QCOMComputeQueue(HWQueue):
 class QCOMArgsState(HCQArgsState):
   def __init__(self, buf:HCQBuffer, prg:QCOMProgram, bufs:tuple[HCQBuffer, ...], vals:tuple[int, ...]=()):
     super().__init__(buf, prg, bufs, vals=vals)
-    self.buf.cpu_view().view(size=prg.kernargs_alloc_size, fmt='B')[:] = bytes(prg.kernargs_alloc_size)
+    ctypes.memset(self.buf.cpu_view().addr, 0, prg.kernargs_alloc_size)
 
     ubos = [bufs[slot] for _,slot,_,shape in prg.signature if slot < len(bufs) and not is_image_shape(shape)]
     uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in prg.signature if slot < len(bufs) and is_image_shape(shape)]
@@ -488,6 +488,16 @@ class MSMIface:
     self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
     self.allocations:dict[int, MSMAllocation] = {}
     self.allocation_generation = 0
+    self.fault_count = self._fault_count()
+    self.sysprof_enabled = False
+    if PROFILE: self._set_sysprof(2)
+
+  def _fault_count(self) -> int:
+    return msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_FAULTS).value
+
+  def _set_sysprof(self, value:int):
+    msm_drm.DRM_IOCTL_MSM_SET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_SYSPROF, value=value)
+    self.sysprof_enabled = value != 0
 
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
@@ -560,7 +570,13 @@ class MSMIface:
   def sleep(self, _time_spent_since_last_sleep_ms:int):
     time.sleep(MSM_SIGNAL_POLL_SECONDS)
 
-  def profile_finalize(self): pass
+  def on_device_hang(self):
+    fault_count, previous_fault_count = self._fault_count(), self.fault_count
+    self.fault_count = fault_count
+    if fault_count > previous_fault_count: raise RuntimeError(f"MSM GPU faults increased from {previous_fault_count} to {fault_count}")
+
+  def profile_finalize(self):
+    if self.sysprof_enabled: self._set_sysprof(0)
 
   def device_fini(self):
     if (queue_id:=getattr(self, "queue_id", None)) is None: return
@@ -594,6 +610,9 @@ class QCOMDevice(HCQCompiled):
       self.synchronize()
       self.iface.free(self._stack)
       self._stack = self.iface.alloc(sz)
+
+  def on_device_hang(self):
+    if hasattr(self.iface, "on_device_hang"): self.iface.on_device_hang()
 
   def _at_profile_finalize(self):
     super()._at_profile_finalize()
