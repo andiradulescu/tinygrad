@@ -1,5 +1,6 @@
 import ctypes, errno, itertools, mmap, platform, struct, unittest
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 from tinygrad import Device
 from tinygrad.device import TinyELF
@@ -28,7 +29,7 @@ class TestMSMDRMUAPI(unittest.TestCase):
     for struct_type, (size, offsets) in layouts.items():
       with self.subTest(struct=struct_type.__name__):
         self.assertEqual(ctypes.sizeof(struct_type), size)
-        self.assertEqual(tuple(field[2] for field in struct_type._real_fields_), offsets)
+        self.assertEqual(tuple(field[2] for field in cast(Any, struct_type._real_fields_)), offsets)
 
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_GEM_CLOSE), 0x40086409)
     self.assertEqual(ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM), 0xC0186440)
@@ -116,7 +117,7 @@ class RecordingMSMFile(FileIOInterface):
   def mmap(self, start, size, prot, flags, offset):
     return self.cpu_addr
 
-  def munmap(self, addr, size):
+  def munmap(self, addr, size):  # type: ignore[override]
     self.unmaps.append((addr, size))
     return self.unmap_result
 
@@ -125,7 +126,8 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
   def make_msm_iface(fd):
     from tinygrad.runtime.ops_qcom import MSMIface
     iface = object.__new__(MSMIface)
-    iface.dev, iface.fd, iface.queue_id, iface.allocations, iface.allocation_generation = SimpleNamespace(last_cmd=0), fd, 3, {}, 0
+    iface.dev, iface.fd, iface.queue_id = cast(Any, SimpleNamespace(last_cmd=0)), fd, 3
+    iface.allocations, iface.allocation_generation = {}, 0
     return iface
 
   def test_bound_kgsl_submission_reuses_prepared_request(self):
@@ -134,7 +136,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     fd, allocator = RecordingKGSLFile(), HostAllocator()
     iface = object.__new__(KGSLIface)
     iface.fd, iface.ctx = fd, 7
-    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    dev = cast(Any, SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0))
     queue = QCOMComputeQueue(dev)
     queue.q(0x12345678)
     queue.bind(dev)
@@ -161,7 +163,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     unsupported.params[msm_drm.MSM_PARAM_CHIP_ID] = 0x06050000
     with patch("tinygrad.runtime.ops_qcom.glob.glob", return_value=["/dev/dri/renderD128", "/dev/dri/renderD129"]), \
          patch("tinygrad.runtime.ops_qcom.FileIOInterface", side_effect=[unsupported, a630]):
-      iface = MSMIface(SimpleNamespace(), 0)
+      iface = MSMIface(cast(Any, SimpleNamespace()), 0)
     self.assertIs(iface.fd, a630)
 
   def test_bound_queue_writes_commands_through_cpu_mapping(self):
@@ -169,7 +171,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
     allocator = SplitAddressAllocator()
     iface = SimpleNamespace(submit_requires_buffers=False, prepare_submit=lambda *_args: object())
-    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    dev = cast(Any, SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0))
     queue = QCOMComputeQueue(dev)
     queue.q(0x12345678, 0x9abcdef0)
     queue.bind(dev)
@@ -185,11 +187,11 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     args = HCQBuffer(ctypes.addressof(gpu_memory), 64, view=MMIOInterface(ctypes.addressof(cpu_memory), 64))
     data = HCQBuffer(0x123456789abcdef0, 16)
     signature = ((None, 0, dtypes.float32, (1,)), (None, 1, dtypes.uint32, ()))
-    prg = SimpleNamespace(kernargs_alloc_size=64, signature=signature, ibo_cnt=0, tex_cnt=0, samp_cnt=0, NIR=True,
-                          tex_to_image=[], consts_info=[(0x12345678, 24, 4)], buf_off=8, tex_off=64, ibo_off=64, samplers=[])
+    prg = cast(Any, SimpleNamespace(kernargs_alloc_size=64, signature=signature, ibo_cnt=0, tex_cnt=0, samp_cnt=0, NIR=True,
+                                   tex_to_image=[], consts_info=[(0x12345678, 24, 4)], buf_off=8, tex_off=64, ibo_off=64, samplers=[]))
 
     state = QCOMArgsState(args, prg, (data,), vals=(0x87654321,))
-    HWQueue().bind_args_state(state)
+    cast(Any, HWQueue()).bind_args_state(state)
 
     self.assertEqual(bytes(cpu_memory[:8]), bytes(8))
     self.assertEqual(int.from_bytes(cpu_memory[8:16], "little"), data.va_addr)
@@ -210,8 +212,8 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     lib[image_offset:image_offset+len(image)] = image
 
     allocator = SplitAddressAllocator()
-    dev = SimpleNamespace(device="QCOM", renderer=object(), allocator=allocator, prof_prg_counter=itertools.count(),
-                          _ensure_stack_size=lambda _size: None)
+    dev = cast(Any, SimpleNamespace(device="QCOM", renderer=object(), allocator=allocator, prof_prg_counter=itertools.count(),
+                                    _ensure_stack_size=lambda _size: None))
     QCOMProgram(dev, TinyELF(bytes(lib), "test", Target("QCOM"), ()))
 
     gpu_memory, cpu_memory = allocator.memories[0]
@@ -224,15 +226,16 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     gpu_memory, cpu_memory = (ctypes.c_ubyte * 32)(*[0xaa] * 32), (ctypes.c_ubyte * 32)(*[0xaa] * 32)
     args = HCQBuffer(ctypes.addressof(gpu_memory), 32, view=MMIOInterface(ctypes.addressof(cpu_memory), 32))
     lib, data = HCQBuffer(0x200000, 128), HCQBuffer(0x600000, 4096)
-    prg = SimpleNamespace(NIR=True, wgsz=1, hregs=0, fregs=0, brnchstck=0, shared_size=1, prg_offset=0,
-                          lib_gpu=lib, pvtmem_size_per_item=0, pvtmem_size_total=0, hw_stack_offset=0, image_size=128,
-                          samp_cnt=1, samp_off=0, tex_cnt=0, ibo_cnt=0, wgid=0xfc, lid=0xfc)
+    prg = cast(Any, SimpleNamespace(NIR=True, wgsz=1, hregs=0, fregs=0, brnchstck=0, shared_size=1, prg_offset=0,
+                                   lib_gpu=lib, pvtmem_size_per_item=0, pvtmem_size_total=0, hw_stack_offset=0, image_size=128,
+                                   samp_cnt=1, samp_off=0, tex_cnt=0, ibo_cnt=0, wgid=0xfc, lid=0xfc))
     dummy, stack, border = HCQBuffer(0x300000, 4096), HCQBuffer(0x400000, 4096), HCQBuffer(0x500000, 4096)
-    dev = SimpleNamespace(iface=SimpleNamespace(submit_requires_buffers=True), gpu_id=(6, 0, 0), dummy_buf=dummy, dummy_addr=dummy.va_addr,
-                          _stack=stack, border_color_buf=border)
+    dev = cast(Any, SimpleNamespace(iface=SimpleNamespace(submit_requires_buffers=True), gpu_id=(6, 0, 0), dummy_buf=dummy,
+                                    dummy_addr=dummy.va_addr, _stack=stack, border_color_buf=border))
     prg.dev = dev
 
-    queue = QCOMComputeQueue(dev).exec(prg, SimpleNamespace(bind_data=[], buf=args, prg=prg, bufs=(data,)), (1, 1, 1), (2, 3, 4))
+    queue = QCOMComputeQueue(dev).exec(prg, cast(Any, SimpleNamespace(bind_data=[], buf=args, prg=prg, bufs=(data,))),
+                                       (1, 1, 1), (2, 3, 4))
 
     self.assertEqual(bytes(cpu_memory[4:16]), struct.pack("III", 2, 3, 4))
     self.assertEqual(bytes(gpu_memory), bytes([0xaa] * len(gpu_memory)))
@@ -286,7 +289,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
     allocator, iface = HostAllocator(), RecordingIface()
     dummy = allocator.alloc(0x100, None)
-    dev = SimpleNamespace(iface=iface, allocator=allocator, dummy_buf=dummy, dummy_addr=dummy.va_addr, gpu_id=(6, 3, 0), last_cmd=0)
+    dev = cast(Any, SimpleNamespace(iface=iface, allocator=allocator, dummy_buf=dummy, dummy_addr=dummy.va_addr, gpu_id=(6, 3, 0), last_cmd=0))
     signal = QCOMSignal(base_buf=allocator.alloc(16, None))
     queue = QCOMComputeQueue(dev).signal(signal, 1)
     queue.bind(dev)
@@ -312,7 +315,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
         return len(self.submitted)
 
     allocator, iface = HostAllocator(), RecordingIface()
-    dev = SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0)
+    dev = cast(Any, SimpleNamespace(iface=iface, allocator=allocator, last_cmd=0))
     queue = QCOMComputeQueue(dev)
     queue.q(0x12345678)
     queue._add_buffers(HCQBuffer(UOp.variable("address", 0, 2**64-1, dtypes.uint64), 0x100))
@@ -364,11 +367,11 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
   def test_msm_submission_rejects_freed_allocation_after_iova_reuse(self):
     fd = RecordingMSMFile()
-    fd.iova = lambda _handle: 0x10000000
     iface = self.make_msm_iface(fd)
-    stale = iface.alloc(0x100)
-    iface.free(stale)
-    command = iface.alloc(0x100)
+    with patch.object(fd, "iova", return_value=0x10000000):
+      stale = iface.alloc(0x100)
+      iface.free(stale)
+      command = iface.alloc(0x100)
 
     with self.assertRaisesRegex(RuntimeError, f"MSM GEM handle {stale.meta.handle} is already freed"):
       iface.prepare_submit(command, command.size, {stale})
@@ -377,7 +380,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     from tinygrad.runtime.ops_qcom import QCOMSignal
 
     class AdvancingIface:
-      def __init__(self): self.calls, self.signal = 0, None
+      def __init__(self): self.calls, self.signal = 0, cast(Any, None)
       def sleep(self, _time_spent_since_last_sleep_ms):
         self.calls += 1
         self.signal.value = 1
@@ -405,7 +408,7 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     fd = RecordingMSMFile()
     with patch("tinygrad.runtime.ops_qcom.PROFILE", 1), patch("tinygrad.runtime.ops_qcom.glob.glob", return_value=["/dev/dri/renderD128"]), \
          patch("tinygrad.runtime.ops_qcom.FileIOInterface", return_value=fd):
-      iface = MSMIface(SimpleNamespace(), 0)
+      iface = MSMIface(cast(Any, SimpleNamespace()), 0)
     self.assertEqual(fd.set_params, [(msm_drm.MSM_PIPE_3D0, msm_drm.MSM_PARAM_SYSPROF, 2)])
 
     iface.profile_finalize()
