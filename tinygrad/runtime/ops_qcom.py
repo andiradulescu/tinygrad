@@ -456,15 +456,15 @@ class MSMAllocation:
   mapped_size: int
   cpu_addr: int
 
-def _open_msm_render_node(path:str) -> FileIOInterface|None:
-  try: fd = FileIOInterface(path, os.O_RDWR)
+def _open_msm_render_node(path:str) -> tuple[FileIOInterface, int]|None:
+  try:
+    fd = FileIOInterface(path, os.O_RDWR)
+    name = (ctypes.c_ubyte * msm_drm.DRM_CLIENT_NAME_MAX_LEN)()
+    version = msm_drm.DRM_IOCTL_VERSION(fd, name_len=len(name), name=name)
+    if bytes(name[:version.name_len]) != b"msm": return None
+    chip_id = msm_drm.DRM_IOCTL_MSM_GET_PARAM(fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID).value
+    return fd, chip_id
   except OSError: return None
-  try: msm_drm.DRM_IOCTL_MSM_GET_PARAM(fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_GPU_ID)
-  except OSError:
-    os.close(fd.fd)
-    del fd.fd
-    return None
-  return fd
 
 class MSMIface:
   count = 1
@@ -475,14 +475,14 @@ class MSMIface:
     if device_id != 0: raise RuntimeError(f"QCOM:{device_id} does not exist (1 MSM DRM device available)")
     self.dev = dev
     for path in sorted(glob.glob("/dev/dri/renderD*")):
-      if (fd:=_open_msm_render_node(path)) is not None:
-        self.fd = fd
+      if (node:=_open_msm_render_node(path)) is not None:
+        fd, chip_id = node
+        gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
+        if gpu_id != (6, 3, 0): continue
+        self.fd, self.chip_id, self.gpu_id = fd, chip_id, gpu_id
         break
     else: raise RuntimeError("No MSM DRM render node found")
 
-    self.chip_id = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID).value
-    self.gpu_id = (self.chip_id >> 24, (self.chip_id >> 16) & 0xff, (self.chip_id >> 8) & 0xff)
-    if self.gpu_id != (6, 3, 0): raise RuntimeError(f"MSM DRM requires Adreno 630, got chip_id={self.chip_id:#x}")
     self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
     self.allocations:dict[int, MSMAllocation] = {}
     self.allocation_generation = 0
@@ -496,6 +496,8 @@ class MSMIface:
       iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
       cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
+      view = MMIOInterface(cpu_addr, size)
+      if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
     except Exception as e:
       cleanup_error = RuntimeError(f"Failed to unmap MSM GEM handle {gem.handle}") \
         if cpu_addr is not None and self.fd.munmap(cpu_addr, mapped_size) != 0 else None
@@ -504,10 +506,9 @@ class MSMIface:
       if cleanup_error is not None: raise cleanup_error from e
       raise
 
-    if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
     allocation = MSMAllocation(gem.handle, iova, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
-    return HCQBuffer(iova, size, meta=allocation, view=MMIOInterface(cpu_addr, size), owner=self.dev)
+    return HCQBuffer(iova, size, meta=allocation, view=view, owner=self.dev)
 
   def map(self, _ptr:int, _size:int) -> HCQBuffer: raise RuntimeError("MSM DRM does not support external pointer mapping")
 
@@ -521,7 +522,9 @@ class MSMIface:
     if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
-    if isinstance(allocation:=mem.base.meta, MSMAllocation) and self.allocations.get(allocation.handle) is allocation: return allocation
+    if isinstance(allocation:=mem.base.meta, MSMAllocation):
+      if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
+      return allocation
     if not isinstance(mem.va_addr, int): raise RuntimeError("MSM buffer address must be resolved before submission")
     matches = [allocation for allocation in self.allocations.values()
                if allocation.iova <= mem.va_addr and mem.va_addr + mem.size <= allocation.iova + allocation.mapped_size]
@@ -532,6 +535,7 @@ class MSMIface:
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
     command_allocation = self._resolve_allocation(command)
     command_offset = int(command.va_addr) - command_allocation.iova
+    if command_offset % 4: raise ValueError(f"MSM command offset must be a multiple of 4, got {command_offset}")
     if command_offset < 0 or size > command.size or command_offset + size > command_allocation.mapped_size:
       raise ValueError("MSM command range is outside its buffer")
 

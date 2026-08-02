@@ -66,15 +66,26 @@ class RecordingMSMFile(FileIOInterface):
     self.cpu_addr, self.get_iova_errno, self.wait_errno, self.close_errno = ctypes.addressof(self.memory), None, None, None
     self.unmap_result = 0
     self.next_handle = 17
+    self.driver_name = b"msm"
+    self.params = {msm_drm.MSM_PARAM_GPU_ID: 630, msm_drm.MSM_PARAM_CHIP_ID: 0x06030000, msm_drm.MSM_PARAM_FAULTS: 0}
     self.news, self.infos, self.unmaps, self.closed_handles = [], [], [], []
-    self.submissions, self.waits = [], []
+    self.submissions, self.waits, self.set_params = [], [], []
 
   def __del__(self): pass
   @staticmethod
   def iova(handle): return 0x10000000 + handle * mmap.PAGESIZE
 
   def ioctl(self, request, arg):
-    if request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
+    if request == ioctl_number(msm_drm.DRM_IOCTL_VERSION):
+      name = self.driver_name[:arg.name_len]
+      ctypes.memmove(arg.name, name, len(name))
+      arg.name_len = len(name)
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM):
+      arg.value = self.params[arg.param]
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_SET_PARAM):
+      self.set_params.append((arg.pipe, arg.param, arg.value))
+      self.params[arg.param] = arg.value
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
       self.news.append((arg.size, arg.flags))
       arg.handle, self.next_handle = self.next_handle, self.next_handle + 1
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_INFO):
@@ -132,6 +143,14 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
       (fd.commands[0][0], 7, ctypes.sizeof(kgsl.struct_kgsl_command_object), queue.hw_page.va_addr, 4, kgsl.KGSL_CMDLIST_IB),
     ])
+
+  def test_render_node_requires_msm_driver(self):
+    from tinygrad.runtime.ops_qcom import _open_msm_render_node
+
+    fd = RecordingMSMFile()
+    fd.driver_name = b"vgem"
+    with patch("tinygrad.runtime.ops_qcom.FileIOInterface", return_value=fd):
+      self.assertIsNone(_open_msm_render_node("/dev/dri/renderD128"))
 
   def test_bound_queue_writes_commands_through_cpu_mapping(self):
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue
@@ -231,6 +250,13 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)] * 2)
     self.assertEqual(fd.closed_handles, [18, 17])
 
+  def test_msm_submission_rejects_unaligned_command_offset(self):
+    fd = RecordingMSMFile()
+    iface = self.make_msm_iface(fd)
+    command = iface.alloc(0x100).offset(2, 4)
+    with self.assertRaisesRegex(ValueError, "offset must be a multiple of 4"):
+      iface.prepare_submit(command, command.size, set())
+
   def test_bound_msm_queue_prepares_referenced_buffers_once(self):
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMSignal
 
@@ -298,6 +324,13 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertEqual(fd.unmaps, [])
     self.assertEqual(fd.closed_handles, [17])
 
+  def test_msm_allocation_view_failure_releases_mapping_and_handle(self):
+    fd = RecordingMSMFile()
+    with patch("tinygrad.runtime.ops_qcom.MMIOInterface", side_effect=RuntimeError("view failed")):
+      with self.assertRaisesRegex(RuntimeError, "view failed"): self.make_msm_iface(fd).alloc(17)
+    self.assertEqual(fd.unmaps, [(fd.cpu_addr, mmap.PAGESIZE)])
+    self.assertEqual(fd.closed_handles, [17])
+
   def test_msm_free_failure_keeps_allocation_state_consistent(self):
     fd = RecordingMSMFile()
     iface = self.make_msm_iface(fd)
@@ -314,6 +347,17 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     self.assertNotIn(buf.meta.handle, iface.allocations)
     self.assertEqual(iface.allocation_generation, 1)
     self.assertEqual(fd.closed_handles, [buf.meta.handle])
+
+  def test_msm_submission_rejects_freed_allocation_after_iova_reuse(self):
+    fd = RecordingMSMFile()
+    fd.iova = lambda _handle: 0x10000000
+    iface = self.make_msm_iface(fd)
+    stale = iface.alloc(0x100)
+    iface.free(stale)
+    command = iface.alloc(0x100)
+
+    with self.assertRaisesRegex(RuntimeError, f"MSM GEM handle {stale.meta.handle} is already freed"):
+      iface.prepare_submit(command, command.size, {stale})
 
   def test_msm_signal_wait_sleeps_between_polls(self):
     from tinygrad.runtime.ops_qcom import MSM_SIGNAL_POLL_SECONDS
