@@ -102,6 +102,8 @@ class RecordingMSMFile(FileIOInterface):
                                [(bo.flags, bo.handle, bo.presumed) for bo in bos],
                                [(cmd.type, cmd.submit_idx, cmd.submit_offset, cmd.size) for cmd in cmds]))
       arg.fence = len(self.submissions)
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW):
+      arg.id = 3
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_WAIT_FENCE):
       self.waits.append((arg.fence, arg.timeout.tv_sec, arg.timeout.tv_nsec, arg.queueid))
       if self.wait_errno is not None: raise OSError(self.wait_errno, "wait failed")
@@ -151,6 +153,16 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     fd.driver_name = b"vgem"
     with patch("tinygrad.runtime.ops_qcom.FileIOInterface", return_value=fd):
       self.assertIsNone(_open_msm_render_node("/dev/dri/renderD128"))
+
+  def test_render_node_discovery_skips_unsupported_msm_gpu(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+
+    unsupported, a630 = RecordingMSMFile(), RecordingMSMFile()
+    unsupported.params[msm_drm.MSM_PARAM_CHIP_ID] = 0x06050000
+    with patch("tinygrad.runtime.ops_qcom.glob.glob", return_value=["/dev/dri/renderD128", "/dev/dri/renderD129"]), \
+         patch("tinygrad.runtime.ops_qcom.FileIOInterface", side_effect=[unsupported, a630]):
+      iface = MSMIface(SimpleNamespace(), 0)
+    self.assertIs(iface.fd, a630)
 
   def test_bound_queue_writes_commands_through_cpu_mapping(self):
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue
@@ -211,18 +223,20 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
 
     gpu_memory, cpu_memory = (ctypes.c_ubyte * 32)(*[0xaa] * 32), (ctypes.c_ubyte * 32)(*[0xaa] * 32)
     args = HCQBuffer(ctypes.addressof(gpu_memory), 32, view=MMIOInterface(ctypes.addressof(cpu_memory), 32))
+    lib, data = HCQBuffer(0x200000, 128), HCQBuffer(0x600000, 4096)
     prg = SimpleNamespace(NIR=True, wgsz=1, hregs=0, fregs=0, brnchstck=0, shared_size=1, prg_offset=0,
-                          lib_gpu=HCQBuffer(0x200000, 128), pvtmem_size_per_item=0, pvtmem_size_total=0, hw_stack_offset=0,
-                          image_size=128, samp_cnt=0, tex_cnt=0, ibo_cnt=0, wgid=0xfc, lid=0xfc)
-    dummy = HCQBuffer(0x300000, 4096)
-    dev = SimpleNamespace(iface=SimpleNamespace(submit_requires_buffers=False), gpu_id=(6, 0, 0), dummy_buf=dummy, dummy_addr=dummy.va_addr,
-                          _stack=HCQBuffer(0x400000, 4096), border_color_buf=HCQBuffer(0x500000, 4096))
+                          lib_gpu=lib, pvtmem_size_per_item=0, pvtmem_size_total=0, hw_stack_offset=0, image_size=128,
+                          samp_cnt=1, samp_off=0, tex_cnt=0, ibo_cnt=0, wgid=0xfc, lid=0xfc)
+    dummy, stack, border = HCQBuffer(0x300000, 4096), HCQBuffer(0x400000, 4096), HCQBuffer(0x500000, 4096)
+    dev = SimpleNamespace(iface=SimpleNamespace(submit_requires_buffers=True), gpu_id=(6, 0, 0), dummy_buf=dummy, dummy_addr=dummy.va_addr,
+                          _stack=stack, border_color_buf=border)
     prg.dev = dev
 
-    QCOMComputeQueue(dev).exec(prg, SimpleNamespace(bind_data=[], buf=args, prg=prg, bufs=()), (1, 1, 1), (2, 3, 4))
+    queue = QCOMComputeQueue(dev).exec(prg, SimpleNamespace(bind_data=[], buf=args, prg=prg, bufs=(data,)), (1, 1, 1), (2, 3, 4))
 
     self.assertEqual(bytes(cpu_memory[4:16]), struct.pack("III", 2, 3, 4))
     self.assertEqual(bytes(gpu_memory), bytes([0xaa] * len(gpu_memory)))
+    self.assertEqual(set(queue._buffers), {args, lib, stack, data, border, dummy})
 
   def test_msm_submission_includes_referenced_buffers_and_is_reusable(self):
     fd = RecordingMSMFile()
@@ -359,13 +373,47 @@ class TestQCOMKernelInterfaces(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, f"MSM GEM handle {stale.meta.handle} is already freed"):
       iface.prepare_submit(command, command.size, {stale})
 
-  def test_msm_signal_wait_sleeps_between_polls(self):
-    from tinygrad.runtime.ops_qcom import MSM_SIGNAL_POLL_SECONDS
+  def test_msm_signal_wait_yields_until_timeline_advances(self):
+    from tinygrad.runtime.ops_qcom import QCOMSignal
 
-    iface = self.make_msm_iface(RecordingMSMFile())
-    with patch("tinygrad.runtime.ops_qcom.time.sleep") as sleep:
-      iface.sleep(0)
-    sleep.assert_called_once_with(MSM_SIGNAL_POLL_SECONDS)
+    class AdvancingIface:
+      def __init__(self): self.calls, self.signal = 0, None
+      def sleep(self, _time_spent_since_last_sleep_ms):
+        self.calls += 1
+        self.signal.value = 1
+
+    iface, allocator = AdvancingIface(), HostAllocator()
+    signal = QCOMSignal(base_buf=allocator.alloc(16, None), owner=SimpleNamespace(iface=iface), is_timeline=True)
+    signal.should_return, iface.signal = False, signal
+    signal.wait(1, timeout=100)
+    self.assertEqual(iface.calls, 1)
+
+  def test_msm_reports_new_gpu_faults_on_timeout(self):
+    fd = RecordingMSMFile()
+    iface = self.make_msm_iface(fd)
+    iface.fault_count = 2
+    fd.params[msm_drm.MSM_PARAM_FAULTS] = 5
+
+    with self.assertRaisesRegex(RuntimeError, "MSM GPU faults increased from 2 to 5"):
+      iface.on_device_hang()
+    self.assertEqual(iface.fault_count, 5)
+    iface.on_device_hang()
+
+  def test_msm_profile_preserves_counters_and_disables_suspend(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+
+    fd = RecordingMSMFile()
+    with patch("tinygrad.runtime.ops_qcom.PROFILE", 1), patch("tinygrad.runtime.ops_qcom.glob.glob", return_value=["/dev/dri/renderD128"]), \
+         patch("tinygrad.runtime.ops_qcom.FileIOInterface", return_value=fd):
+      iface = MSMIface(SimpleNamespace(), 0)
+    self.assertEqual(fd.set_params, [(msm_drm.MSM_PIPE_3D0, msm_drm.MSM_PARAM_SYSPROF, 2)])
+
+    iface.profile_finalize()
+    iface.profile_finalize()
+    self.assertEqual(fd.set_params, [
+      (msm_drm.MSM_PIPE_3D0, msm_drm.MSM_PARAM_SYSPROF, 2),
+      (msm_drm.MSM_PIPE_3D0, msm_drm.MSM_PARAM_SYSPROF, 0),
+    ])
 
   def test_msm_rejects_external_pointer_mapping(self):
     with self.assertRaisesRegex(RuntimeError, "external pointer"):
