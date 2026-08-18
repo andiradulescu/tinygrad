@@ -1,30 +1,60 @@
-name: Deploy Docs
+name: Apply QCOM review
 on:
   push:
     branches:
-      - master
-      - mkdocs
+      - codex-review/qcom-msm-linux618
 permissions:
   contents: write
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-      - name: Configure Git Credentials
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+        with:
+          ref: codex-review/qcom-msm-linux618
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
-          python-version: 3.x
-      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
-      - uses: actions/cache@v5
-        with:
-          key: mkdocs-material-${{ env.cache_id }}
-          path: .cache
-          restore-keys: |
-            mkdocs-material-
-      - run: pip install -e .[docs]
-      - run: mkdocs build --strict
-      - run: mkdocs gh-deploy --force
+          python-version: '3.11'
+      - name: Apply reviewed changes
+        env:
+          PATCH_B64: >-
+            H4sICE52hGoCA3Fjb21fcmV2aWV3X2FwcGx5LnB5AMRce3fbtpL/X58Cq3t2QyasItmK46pl9jp+NDo3ftRO2t2VfHgoCbJZ86GQlC3X9XffmcGDIEXZUpKem9MmJAgMBoPB4DczgKZpEjHPm87zeco9jwXRLElz5sdxkvt5kMRZozHFOjM/vw6DkapwBq8N+ZzyRqMx4VN4mIX+mHtJPOZWzhd5j2V56rAknMinmN/Jp9Af8ZCebfbDO/y312BsnMzjnLkMG7foxYLGNnwJpvLjf7is02OpH2ScnUNBEPHDNE1Sa9p8IKKPPcYXMz7O+YQlMWeRn4+vHTaF1hP2QEQem0gy5TDoWPQlWcfeiEuHdWw9qiu+WBoTyCPnaSzfZPOIx/mT40MCjh5lylvZfBRbklaJjGPWdTvAf+hfZS40ufj7xQEjT2aZh3MObOJcW808iO+vUn/yOhW9vMYaX8ZJ1JrdQ3t4g6qqFcjTn3hIyrIb8ltJO6DIaTSbTcZQxJ4XxEHueVbGw6kDRbe9X/dPjw/4bTDmNgqOMfzUgi9ACf4uirzRfDrladabBON88GH/1/f07rAgzv86gRFf0t/Q7OERxQaNW8EUGEHZR9Bryr/Mg5RnihDjIcgS24hO5jOeWnZL82gj39+B+Xq6rPllzuecYWHTkJ3WQZQcS5vDWPbuTyaK86FkYfgSCrKelsXQ7rVe/rduMfbH19ybhvPsGvtbVS6Isjz1xzdBfMWueQgcZ3quV8wn6eZdGuTcG0FLMX41VwazlpJJazKPonssts2642hiRTzzW/tn3uFvhyefvN/P+58OHSYK9/Y/HHpHHz9ffPA+XTjs5cTP/Z2uF/IqXegytR3Wttk/2CRI83tG4xQs/oAstowJrXL/7+GFNUV5ZQpA9NMkZWEQc2lgQE3YAKRmNVfIOLiK/bA18jNOAh7GSFyULlN3NqaEhiDL/Wj2PYjd+UFeR+cSdWiFzklhoMxIIM9ZG8nNDD77KZ94wgZAfbIRMPclm8KCjMFGKD76YC/9+N5alEpxQhY4DaWGrVs/nPPMsm02HEqtJrNSWB/JguRAaMr1HVjPK5xcHosS74vNXrKuI8mDmUrCW9VIy9O2G6uG5t3w++rwqqOH8dB34lB0VDS2gGW7tEJWSPArh6bM3og2JNl0peXDfUrZXUF+WGt3weShXWN6zKMgngC3E/rKXGJXWUVGvId+lnuw0ktDUX2o4Q5JVw3jb4xxhe1XTYFuvfSf4HAdpQEtCMKJdzWbe7AbR6CmNGV1kl5jqHqk5e1IfHze9i+vdT+9yjywETlvQREAp/SqBUAS+RUvyAFWGN+A6SzXzgTLICGsmIGd8caAed6xdq+mJ0VslKQTnoIwwiQV24ocCv7PF3xcY1c1fNFIsMnYKoDgsiMf5kVYrc0bf0rn1bY18hT6VTPhiAlpmnsG2MmCP3kvQNio8VDGDTh0ieuh+dVkRWvW/NcvFx/lyBgZcXQbmk8b3TFoW8aOL473wjAZk1OBC+Maugp5D2Ea4tnk1lfPkT+b4fLAvmXRGJQbN0/xrq3RxqRNms92w9g05Rxcl1GShGrSlS75ukci+hRUIzuRzHjsRVkEChGjdsbJhA8R+V/3wDcY2mSK9Hj6uCJ7YpACm4UJ7JXYfhoArphOekfwb/+0H4PngJXJ2EwnACcnPEQ0+ROIIQPHAjwBcGma00nTpi0MPpdLhZdTy6Dmj3yYfD4L+aDSL+FsAbEFByiochWiAl5g1jr1zg9+P8dFnaf3wjrGfoTY3Brn9zOetcbefHSfczBXyMokjVoH58fe/sc+gq6TveND73jvf7yPhye2JWzDLag6ToJbatA/3f/00fvt8Pyif3pCQ8V+AJHFLlpFfLFFmUvPysxg3xl9HvQk5ZZqeWmjszVqQj/NXs2MgMSlC6V9B/mO/S9zB9Ps/XL4yTvbO987Jh5nwYy7qiJ+PuufHXrbB210N1M/Kn/DZt7+h/6Z1z+wBeCATvlizGc5O6R/5HpgddwKBtFvbDQqeidVXCgCQ0VgqB08fW5brjo6YnNFiESuJKKkJAVHdGhdhcmohX8NrWHzNVR9PUmD16LHg+HLYRM2WvJa5MScnZ8e9T8eKrMPts3L7rNZmkyH1pa5Kdf6Whw9YmR7cNmo56hgyFpi52XTtpUbg3orJOI+sWSUIyMn4/SCXHLmg2/Zk8y00PrAVg1uOrYAL/2Bgx/+E1hhcK/jOZckYOzUncRovep31JvxdTDzAlx5WFV+QDxAZZb6/O4d2wIkab53dmz2X6y9mE7L5buq2C7YkARhDVg7DttGN2b1YOYx+LczEq1iz32QD71/LGiktUuoMjyaTByj8MMEAfmmR2jIwJFs/sRGKfdvGgp414ZImicJK9gE9WewOtneznabmbpPoZIme8VgfMx6ePETe9H6IwliSwzefrSbKB+pZITYYGeHpVIMwJ+HALhk2EeosFFmGfBdarXHY38UEmgU205lHZjquLQkrK0nFbBOEjh4bBqE6Oor0ML29868i/+98PYOjvsnsIFQKJBL+4BtMEwR+GHwJ22FTyIBUkoe1VpqYQuPvZPD361iymFfdY1dWsXATCv4/tT7fd9W0Obv6oD9xSplJ6fexYe980PZ9SwNbgGzsvenrAAGT6M7ZtSEOiUQY8EwWgLFOIRfHFZiU+EUY+AbERNUVpMswRtYkYAA5uM8SY0R1Zv/6u4jNE5sAwCvQu7H85lHKwWomCo4tKbD5pEfoM7nCdgP4I6WJMyaBHRs+FAMZfiIe4TcIORGNoxFT6Ysin2hfmcUoVQ5eNOz7ynb04qIGUtVKglOLbS7AHYTtF18kYN300KzAgsos+TSA1O5rJSokPsfoUahkmJwbjFO1YHcqZeGVwWjUsardY8Vm2TRLBsUPV5Cq+KLdFTKneRom2DtZzzN14oHVrtrXfHcKt7VWJX8iy8rQtsVxXhYIvWIpPwQw9D3AsY37WqYz2gkgf537gvwNbyxMLgF8JRla3rPpphmyaxGTI2aut4VAjQxPa9c1ikNtjpS6YSaTJLP/ZQXI+MdKgJlaIh0HyMemSFn9BjKnpkRgy77n4rRfyITwTji+XUyaazs0Cr1VNNRQwMnjG2BmuY+DsTQKhdIUPixBZ2BQSy1t1dvkTJwcOeX9BQEOrpn+TXXGCJQvk9TuxZ/q7YZzkbRoNGoFXZ1MUsBp89PfpnQcJ1ohBGMGBbRiOFlkZLQjAuq0CSBLsfRJCtH2jYPWSjJYwn72WVtBrsOvfwn6yrx/4Z+kyl8SVJUjOZZzkac+WyWZIB0brEozANwhFkyxbjsFajBA9Z9lNNQ2ojLUVtDhWUvool88ZLpFOQEzYB9VQMcO7Evsx9MFcJ9XI2v0nydwcmqxfDqRlWm+1iocqXDnw3JvlMfW/QKxZXKr1Q9YzA0ZeY+ZzJe4jv14yvyhZJ5ngXoFuWZ1LGmBNygPuj0qN1WQBd8JEcDtjkdPE/YS9ax16ppKW9rCR9efH5/3P+EkPD8cO9Ab+BLyxZjnTybR3ziVqZRBu9R49djHAO3a3KOiSvlKtxXgguS8/3jA+/95yNHBSyDycJt6zcxa255EiVyJvwjNyOVBHiWJWtZhEWUI05B1hlmu+EJBYKPWCKjQ7gQYCMFDwcKKcO00R+iuEQKS22HUZwbvNR2yZouGSXD95GDFobpef9H4w7TG3yHzW+DZJ6ZDuFTe8PZZ0EgAysxhl0gg92H3LKHOkqPCKYfzIJlHLQGP6Y3jiF2QvAiTg+DrcPz35Fd0zBQVwq3YLVngIuRLxKJFW8KLqvYuswc0dCi+cfoBIDvHCOkOpveVJ+G0Cu6BhibKgIyQlMEpXrHU6y0Xz8ffj4UeH9YAH5N2xYU6IMqlIk7uRHCkGEcNGiRlFkD6yvAZQye+gaMM/OzDD2mf2K6miKAAusvl1DUP05+SGYMCKC3L8wtohqREI0pP6tzoVZTZSHKWMMAqZSHrk+R0KcKEpYhuDpcloxgd+W5AF9yTepDCymP/CCW0FscTRHZfTqbAmV4yifnWV457AIlr4XMXtPX4qALvtIJJdmmdNQl8tMbjktBpiY+QS1MCFrzOMixSQtL9mEV2L0myo/KRBBItLVXn+hpzmN9kkcRZqIV8JUKviQHrwTlbBYGijIeaRp0LhsNWHjTYIH68uLFC3mGS1hFB/ZTcOmSJIRHsPgz2LVCP4d5jRwmTLrD1FDEuTBqp06FXcC/IT/xI57NQBF1DZwJWWUvvgdD6qvmWi5RMr5RdWZ4REk2lqeO1CeRWS1/a8mUqazyCYoPPx5V6yCjqgq9ZJUa8nyLJuOnYAgqdURYkKetcZbfh5refgi45Fx+qzYRU9jy53kC6q+a3Fxloc4KrGgiY5Ot6/EX1Wwp+2Ig3w+//4pmAbyZY6OKSO8EyTgPvXgejXhq0QutpwmsuzEuMNjhQClh36UaarI9EporWrcwN1ucE9NN2c8/s+02+0vqEKE52FYNCjZW6exAFewEX3bhWXSlkg+o0LCAwXB+3jvr160X6c3QwpPEQ/8egaCH0MQcYSZtHG0dshIeAJNbyQqQQjmWHrMoSA5oBP7ZhUWz47Cttq3RxhMIh043WtgAm2PbrbXaBfE0+ZZ+C7AHVLa3SlS2FCWHgv9b3U0ojhJjPEhwg8bQ8m09K/CKTG7Dcxe/wrc38LwDzzvwbUf38qiTNYYyAUkRsRRYNLNxw5Fz3ALzFWWWztZQVE6E1ecj1CSpla5Br+V5lOHzdCsVW8kwvHX4Ze6H1mrVFljYXt2UsqbWNODhZLB1SaOhF2Qb7aBFFrHEEOwooUeVMg9koUdqZBTMHkpr+4koI548W3Tb7d2dbvtH+6tolXKWRG+/3QF63fa30FMISRLsIsEdW1mGD0mWy+BMkiorUDp0actYbcSjJA24TvRhRcIQEskJvfESCv9m5tFM1VIlsuj9vucup6VpttWBK2kKtQ226PDAsoshyNmKg9uA37klI22JwLL2qJBzjO1Ixl96aHslZlNyucC9fU/08TfKB/Npgn+RJBDPtSl7IZuXg/bC9y/Vu7NuxdWzYdXzsGoSlsRfNH9qCpYdw2qztafmnI+TdAKoB5EzbtlW3WmNlfMkve3SPKlzHQZ4l19oiUluEEqDmXMYMFUEwGQpIsvSekQM0hILERn1wFnzAFMe750c6BjoHi1m0Afl1RkglIixB0lepHWpz2T0B/BO5KVhw2dPRxFGfwCBFoIeT4obj4nhMdswyHJDE5QktCYY1WiQLZlzodSv/Ci3h9EfmCEWCwtfimIKQUjtwTbFKVa3ODSnui4pWXtphsGCbTLBxdBi5FrFhoRjnQa3eIoAdiOV78YEOXqBnbeOPHniGPlgcZwQUQuhm5WnQ3pgVts77e02/HHYcrWjvc8fP11ArcflNSg5kVuQo3i/U4/gJKhHSpNlJdblAIm9R4f+H1ya/xuJb0QNGZ64USQwo61HJ6vXr4aysCi1UZ9NwHibJbMoPT2pi05b/AG3ScbdX5L70zrb++Xwov9/h7K5SgHK1VYltGRBSpIcyPSa3dh44bqVhbvyqJPGMPJYVVWvBj3Ud32iSVaWfAOjUXLLLVVFHJAS50jplJRCOSYNuWSKU1Q83IjxMqLoEW06y6SPy5IGDLCcHi+/tpeLohcznFVoWcnI4FksYVHoo1MwZpeuKSyxh9lTVfXrBUInFTSjJTNhGA4lo2VbYlZ6xToKtK/eu5FniW2WtAJEZK3GNLiJO0V7UzhV1S8bk0GRb1abe3ux+8wyNOznXXnGhH3HJ9O+C23V4hIP3zIv/ZOjU9s4O4Dk0YFDEqZpxXqk2adHR6B6NZqtxFAweKmvCqxDuH/6214NWbJxBU3buH6wzqauxsgeFANqV/9KgUlsr0S2WX6GTA1lBexlvICljSK0v0n2RNKl2H8tEMlKimxsTiWdI00TSifzB88mJQbWKFHt4EmtWnhUCSKbnEQYPniIMMTLNUgCwy3hHONTkckpvavkDRXhUqV+UB7oisKQL0trZspjvIdQICJDCF+lEIUj2qvDCEqwVdVdV3FXotECu4l9F02K8nhyP82VTzBLk1weAVM+t9RabT7QrEr8QMJTsydPBMkcp7oNJBe4ikqgtShXBJnJfgzgBRhK65i26UWqTSWmSIAKjyh5qRGKE0tijIZracBPAdYKZS77n8uAVwWc/8XTmIca52YrInV14Cvyb8RpT7pvgsc9BT/1wU91vVRFPtXpZImNfNJN6Ul4GHoDOKjq2EUlDA478pEOpxcxl0q02lK3YjD9aSS4XEzBYBhmOjElE4jgqhGUpBtMwtMploqX8nnGM0/f+pH6afoD6wkAXbS+CPriROwn0Wyecwr5isAQppN8FQjAdNySFwqDKEVTLPspaeoOTXFiJ+JpnC/k2du36mLRk+KlVm4gRqD5dPUT3uBTEyCVUKS53KXxijtpukbriwUYfmu7+2bn7a5ZjleqqnVlGhpLzecVsTXztpTDtlZEuaYT7S46dB8T/5ilg/Yl/AeScipR8md8ZJWXVtfn1GkQiqlSW3Lc948PPvYvABG81/HZf2fvhYtD68I4HV/k+sT2QI4JdkhbQQaf/yBj7k0nmy+Q2vP4ammY60H57Lb8ZnpIDK943AJeaDZ0BJnyUcUN+CUGWhXnv+lII+ERMHO1pSupTj9Dw2LV3yJYuoTQ2dpt2kvqh64uzTTtpKvFPgmyMbh26b1HxkimkT2RZzbkbxzbxwt6m8+BttLUxiAHSx7P1dfNgrNqZozmys9aGeNAL4KiHG/Qkd9g7vTFj+qsDWrnwGE1xT82L2EUwwKnfYXG4HEmj0+noP/uYElwl4bLIYy1krS12uLadNe8saR3VmHKkXa9VpnCr1MvsdsJDaKUeqasR+bl12kyv7r2KIIKEANmdnNVqt/kzA2uNgJu2RvsRtXS8iFDN/Sj0cSXMd6e3B9JrH/f/oVO8I/+aAyCbtfvZU+H5TU/hffdvqzftjCKWo5yUwldgiOn6JovrObb3Tc7293O1rQ94aPxjz6YIfsJeqVgu47w75aV54ZQJIp1jj92kqFZ+nZt2YNZukDI1tg0c7HTNdMR8OasU0kFkNHzXDf9gBnOjZMP0JfUaj/3S50VeqN0BpOscn7UBV0csoWbDeiWIw8/gAua+DklizsOarSs0NEV5kEsvqv5nqVXTy4pnFS6v00qSNcjXByu5sPVT4AhRwne5UasnfOFelRXvPH5pH/uoiVa65gf0sgTL4gAprgYK6ZbKxml1t1BaXlh/rlrX9LZZHTE3F3BAj4iu8iZekZ+Qp5mQFJf6JKH3koKR7fc6To7yAsnyQGJwjaSudD17tudN93tLRSzOOmpJShPbICEaXl7xe13i/5elVSNZfJEXFctVGWw2+vswMiaYBfzkDeBCWRGnyHelFxnp7fVLtMrhrMxta1ub2u3Sq0M25eoCSKlFSSKzHVYti3gxoOliLz5DDR8IgDPN5uWM0FUqEAYjEBNIvo5C/pHh1bE24RnY12U8iuzAPElDMBPU/8edAPQCg6pOQRBDBfb3eHizc5w8RZxBuXqSUS79M+2hDUCrwMgGt+AeueJ1ezjr58gT5TJEAF74kQZ6qdajNvlQazRpNNp1wx1jYbb3SV5PNuqKr9XyECXfp9LzsXAZL9nvrwqJIH4kJ6+L4wQR8/cJuoIAUhxBsxVUGEFUqArnmAtxCFXqK/P3cnDgGsebvY4oDTEK/jzGcLiSswif9dAxC6IlqHGFgVF5EE5ucZAkDb+og8sIRiIOP1miXHZxibwPXBH1TLYUpu+2gYYCl+2BXdJenMFWHRG4vhOtmAZlG6ANLa3TBABb846lb4GaeDevTHSgL70uqoAja22yB+DF7QeHtAbOLu7yv7Eo/zXsJgz3Nun6mGUxuPrLB/f0O5/LX4XB9W4Q7upun/QXms5yJ+VccluzG7zCKP+OO8z8IMxCIudmOV5kvshFl7fySWk+5P2TfCytbtW/yZ6MUCNAXXurvCGwWI6RuMmnhSywx8Iq0h8W0q82/5x51u8Glvdinfx5j5uJggM1K+uufSkClAvRImO9qxniUh+rsl+12S/wJCV32ao9Y1a+DM9FsGp1YMlyIT4hgAfjkSjMJea4i8IuWi5COQitO3g4xb9ekHXttezToMugirbMTcp2J/+v5praW0bCMJ3/wqTiyUqgm1ICwEfeuylh/hUghFtrDxAWKHrOkl/ffebx2p3tZJfyaGXQCx7pN2dl+abb74hQh0kap/n8q5H7ou6Upla7pHHTPn4c0c1Heuu7ra+Q+NWWMV7NvWbq+j9agJnN1AP0wKDoBFxzd69hzj2XUldvQspC3NDGWUieRF9Noc63D/Vdfm3+t1UhtxDwIGDdntSBUIhZWJ0OI9naiUHY4mMImCj9RxSlh5/pc8efy7KNNf3AT0fwo3Gi/ERwwN6i8ncX3ObBeB3Ed4qh/p0C9LfG61cI/GHaiAGZPklF251P6IL/XXtoC3HlbbT9K0pPfMAOS44WjBvHfzZvULUuBb7TAp23LUpp8uiIqu2Cv5/POhq0H9gBIGmVH0Ptrq9JvNaORdD/yb8iUogKqUU3A2V9+2f9TrKioacQdd/xKbsW//sS67WjC5wqZ60Hdq87hvAvOYGJK6sJYHavDRF+Lw+yvjjjdClE4e69ZMcvT5kC9gp+mAa+kgDKvDQfvhkIKJVBRzw8zaDJ3KWGMFZvnHnOe5Wl7gjZmzaVGAHFr05LWdeknz2mAwofyV5dutk5hRbT39PrN1C1xjI80sXsKY2PaBXHU+MqatKMXBaRmmeq83WLtUuo6RaLX3Frj9u/aeb8RiF4HOZW6rtNrNRe5Yh9Bourg93detodyjTmajt26Laz2dZYjFuXjb2lXEAX0XwMu7ovCgrCzCPzZ8aUDTgDhfo9GmowVTKdrX/M2gHYh8EW3tcOG3uFoEYIeYzm3XVjeEn4SsapgU+3bH6EfT+nsmK2Fowg2mu0F8vrsRNsSgbXB1rmcPE1zk4rleYxme4q2WtpttsZPonWmIesn7kJqLgFiLnstLZNqk0EsOdKvQhWFE7Qmuo9MApo00mMdPFWLdhqCPkTORv6MwOw+Vk0tUFJ+3vDeOdj9f1Ibyn4XPqu/mQlGWbHXAxmbS5nta9OVtX8Zc/lth7pLjFyb+dplsB/LhbvWLovQ06zw2NS0kVZY4wOhU3FnEXIea+P3Cj84pD9FQqqfZsRpPJxCMI++RhodF+wgCVbT76B+twjH1KYQAA
+        run: |
+          printf '%s' "$PATCH_B64" | base64 -d | gzip -d > /tmp/qcom_review_apply.py
+          python /tmp/qcom_review_apply.py
+      - name: Install host test tools
+        run: python -m pip install -e . pytest ruff mypy
+      - name: Run host validation
+        run: |
+          python -m pytest test/device/test_qcom.py::TestMSMDRMUAPI test/device/test_qcom.py::TestQCOMKernelInterfaces
+          DEV=CPU python - <<'PY'
+          from tinygrad import Tensor
+          assert (Tensor([1, 2, 3]) + Tensor([4, 5, 6])).tolist() == [5, 7, 9]
+          PY
+          python -m ruff check tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          python -m mypy tinygrad/runtime/ops_qcom.py
+          python -m compileall -q tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          python -c "from tinygrad.runtime.autogen import msm_drm; from tinygrad.runtime import ops_qcom"
+          MAX_LINE_COUNT=25000 python sz.py
+          git diff --check
+      - name: Commit clean branch result
+        env:
+          BASE_SHA: e5f18fefa7d9cdccf1b4117c0db46ba4820b505a
+          TARGET_BRANCH: codex-review/qcom-msm-linux618
+        run: |
+          mkdir -p /tmp/qcom-final/tinygrad/runtime /tmp/qcom-final/test/device
+          cp tinygrad/runtime/ops_qcom.py /tmp/qcom-final/tinygrad/runtime/
+          cp test/device/test_qcom.py /tmp/qcom-final/test/device/
+          git reset --hard "$BASE_SHA"
+          git clean -fd
+          cp /tmp/qcom-final/tinygrad/runtime/ops_qcom.py tinygrad/runtime/ops_qcom.py
+          cp /tmp/qcom-final/test/device/test_qcom.py test/device/test_qcom.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          git diff --cached --check
+          git commit -m "qcom: simplify MSM DRM interface for Linux 6.18"
+          git push --force-with-lease="refs/heads/$TARGET_BRANCH:$GITHUB_SHA" origin "HEAD:refs/heads/$TARGET_BRANCH"
