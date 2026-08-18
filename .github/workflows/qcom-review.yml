@@ -53,6 +53,25 @@ jobs:
           path.write_text(source.replace(old, new))
           PY
           python /tmp/qcom_review_apply.py
+      - name: Normalize reviewed source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tinygrad/runtime/ops_qcom.py')
+          source = path.read_text()
+          replacements = {
+            '  fd.__del__(); hasattr(fd, "fd") and delattr(fd, "fd")\n': '  fd.__del__()\n  if hasattr(fd, "fd"): delattr(fd, "fd")\n',
+            '    if bytes(name[:version.name_len]) != b"msm": _close_msm_file(fd); return None\n': '    if bytes(name[:version.name_len]) != b"msm":\n      _close_msm_file(fd)\n      return None\n',
+            '      except OSError as e: errors.append(f"{path}: {e}"); continue\n': '      except OSError as e:\n        errors.append(f"{path}: {e}")\n        continue\n',
+            '      if gpu_id != (6, 3, 0): errors.append(f"{path}: unsupported chip_id={chip_id:#x}"); _close_msm_file(fd); continue\n': '      if gpu_id != (6, 3, 0):\n        errors.append(f"{path}: unsupported chip_id={chip_id:#x}")\n        _close_msm_file(fd)\n        continue\n',
+            '      self.fd, self.chip_id, self.gpu_id = fd, chip_id, gpu_id; break\n': '      self.fd, self.chip_id, self.gpu_id = fd, chip_id, gpu_id\n      break\n',
+            '    else: raise RuntimeError("No supported MSM DRM A630 render node found" + (f" ({\'; \'.join(errors)})" if errors else ""))\n': '    else:\n      raise RuntimeError("No supported MSM DRM A630 render node found" + (f" ({\'; \'.join(errors)})" if errors else ""))\n',
+          }
+          for old, new in replacements.items():
+            if source.count(old) != 1: raise RuntimeError(f'normalization expected one match: {old!r}')
+            source = source.replace(old, new)
+          path.write_text(source)
+          PY
       - name: Install host test tools
         run: python -m pip install -e . pytest ruff mypy
       - name: Run host validation
