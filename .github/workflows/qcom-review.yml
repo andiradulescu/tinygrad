@@ -22,6 +22,24 @@ jobs:
         run: |
           PATCH_B64=$(sed -n '/PATCH_B64: >-/{n;s/^[[:space:]]*//;p;q}' .github/workflows/docs.yml)
           printf '%s' "$PATCH_B64" | base64 -d | gzip -d > /tmp/qcom_review_apply.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/qcom_review_apply.py')
+          source = path.read_text()
+          old = '''for line, label in [
+            ("    self._add_buffers(signal.base_buf)\\n", "signal buffer tracking"),
+            ("    self._add_buffers(signal.base_buf)\\n", "timestamp buffer tracking"),
+            ("    self._add_buffers(signal.base_buf)\\n", "wait buffer tracking"),
+          ]:
+            ops = replace_once(ops, line, "", label)
+          '''
+          new = '''if ops.count("    self._add_buffers(signal.base_buf)\\n") != 3:
+            raise RuntimeError("expected three signal buffer tracking lines")
+          ops = ops.replace("    self._add_buffers(signal.base_buf)\\n", "")
+          '''
+          if old not in source: raise RuntimeError('signal tracking transform was not found')
+          path.write_text(source.replace(old, new))
+          PY
           python /tmp/qcom_review_apply.py
       - name: Install host test tools
         run: python -m pip install -e . pytest ruff mypy
