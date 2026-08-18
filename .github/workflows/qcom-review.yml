@@ -38,6 +38,18 @@ jobs:
           ops = ops.replace("    self._add_buffers(signal.base_buf)\\n", "")
           '''
           if old not in source: raise RuntimeError('signal tracking transform was not found')
+          source = source.replace(old, new)
+          old = '''ops = replace_once(ops,
+          """    if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
+          """,
+          """    if allocation.freed: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
+          """, "free liveness")
+          '''
+          new = '''free_liveness = "    if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f\\"MSM GEM handle {allocation.handle} is already freed\\")\\n"
+          if ops.count(free_liveness) != 2: raise RuntimeError(f"free liveness: expected two matches, found {ops.count(free_liveness)}")
+          ops = ops.replace(free_liveness, "    if allocation.freed: raise RuntimeError(f\\"MSM GEM handle {allocation.handle} is already freed\\")\\n", 1)
+          '''
+          if old not in source: raise RuntimeError('free liveness transform was not found')
           path.write_text(source.replace(old, new))
           PY
           python /tmp/qcom_review_apply.py
