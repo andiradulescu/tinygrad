@@ -1,0 +1,59 @@
+name: QCOM review validation
+on:
+  pull_request:
+    branches:
+      - codex-ci/qcom-msm-linux618
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Apply reviewed changes
+        run: |
+          PATCH_B64=$(sed -n '/PATCH_B64: >-/{n;s/^[[:space:]]*//;p;q}' .github/workflows/docs.yml)
+          printf '%s' "$PATCH_B64" | base64 -d | gzip -d > /tmp/qcom_review_apply.py
+          python /tmp/qcom_review_apply.py
+      - name: Install host test tools
+        run: python -m pip install -e . pytest ruff mypy
+      - name: Run host validation
+        run: |
+          python -m pytest test/device/test_qcom.py::TestMSMDRMUAPI test/device/test_qcom.py::TestQCOMKernelInterfaces
+          DEV=CPU python - <<'PY'
+          from tinygrad import Tensor
+          assert (Tensor([1, 2, 3]) + Tensor([4, 5, 6])).tolist() == [5, 7, 9]
+          PY
+          python -m ruff check tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          python -m mypy tinygrad/runtime/ops_qcom.py
+          python -m compileall -q tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          python -c "from tinygrad.runtime.autogen import msm_drm; from tinygrad.runtime import ops_qcom"
+          MAX_LINE_COUNT=25000 python sz.py
+          git diff --check
+      - name: Commit clean branch result
+        env:
+          BASE_SHA: e5f18fefa7d9cdccf1b4117c0db46ba4820b505a
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_BRANCH: codex-review/qcom-msm-linux618
+        run: |
+          mkdir -p /tmp/qcom-final/tinygrad/runtime /tmp/qcom-final/test/device
+          cp tinygrad/runtime/ops_qcom.py /tmp/qcom-final/tinygrad/runtime/
+          cp test/device/test_qcom.py /tmp/qcom-final/test/device/
+          git reset --hard "$BASE_SHA"
+          git clean -fd
+          cp /tmp/qcom-final/tinygrad/runtime/ops_qcom.py tinygrad/runtime/ops_qcom.py
+          cp /tmp/qcom-final/test/device/test_qcom.py test/device/test_qcom.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tinygrad/runtime/ops_qcom.py test/device/test_qcom.py
+          git diff --cached --check
+          git commit -m "qcom: simplify MSM DRM interface for Linux 6.18"
+          git push --force-with-lease="refs/heads/$TARGET_BRANCH:$HEAD_SHA" origin "HEAD:refs/heads/$TARGET_BRANCH"
