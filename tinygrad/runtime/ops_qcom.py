@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob
+import os, ctypes, functools, mmap, struct, array, math, sys, time, weakref, contextlib, glob, errno
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from typing import Any
@@ -16,9 +16,6 @@ from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
-# Poll the userspace timeline without busy-spinning or waiting for the later kernel submission fence.
-MSM_SIGNAL_POLL_SECONDS = 0.0001
-
 @functools.cache
 def dcache_flush():
   from tinygrad.uop.ops import UOp, Ops, KernelInfo
@@ -61,42 +58,19 @@ class QCOMSignal(HCQSignal):
 class QCOMComputeQueue(HWQueue):
   def __init__(self, dev:QCOMDevice):
     self.dev = dev
-    self._buffers:dict[HCQBuffer, int|None]|None = {} if dev.iface.submit_requires_buffers else None
     super().__init__()
 
   @suppress_finalizing
   def __del__(self):
-    if (dev:=getattr(self, "binded_device", None)) is not None and (hw_page:=getattr(self, "hw_page", None)) is not None:
-      dev.allocator.free(hw_page, hw_page.size, BufferSpec(cpu_access=True, nolru=True))
+    if self.binded_device is not None: self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
 
   def cmd(self, opcode: int, *vals: int): self.q(pkt7_hdr(opcode, len(vals)), *vals)
 
   def reg(self, reg: int, *vals: int): self.q(pkt4_hdr(reg, len(vals)), *vals)
 
-  def _add_buffers(self, *bufs:HCQBuffer):
-    if self._buffers is None: return
-    for buf in bufs:
-      base = buf.base
-      if base not in self._buffers: self._buffers[base] = None if isinstance(base.va_addr, int) else self._new_sym(base.va_addr)
-
-  def _resolve_submit_buffers(self) -> set[HCQBuffer]:
-    if self._buffers is None: return set()
-    buffers:set[HCQBuffer] = set()
-    for buf, sym_idx in self._buffers.items():
-      if sym_idx is None: buffers.add(buf)
-      elif (address:=self._prev_resolved_syms[sym_idx]) is None: raise RuntimeError("QCOM queue has an unresolved symbolic buffer address")
-      else: buffers.add(HCQBuffer(address, buf.size))
-    return buffers
-
-  def _submit_key(self, dev:QCOMDevice):
-    if self._buffers is None: return None
-    return dev.iface.allocation_generation, tuple(self._prev_resolved_syms[x] for x in self._buffers.values() if x is not None)
-
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
     # TODO: 7xx support.
-    if write_back:
-      self._add_buffers(self.dev.dummy_buf)
-      self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
+    if write_back: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
     if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
@@ -106,7 +80,6 @@ class QCOMComputeQueue(HWQueue):
     return self
 
   def signal(self, signal:QCOMSignal, value=0):
-    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     if self.dev.gpu_id[:2] < (7, 3):
       self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), *data64_le(signal.value_addr), lo32(value))
@@ -117,15 +90,13 @@ class QCOMComputeQueue(HWQueue):
     return self
 
   def timestamp(self, signal:QCOMSignal):
-    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True),*data64_le(signal.timestamp_addr))
     return self
 
   def wait(self, signal:QCOMSignal, value=0):
-    self._add_buffers(signal.base_buf)
     self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY),*data64_le(signal.value_addr),
-             qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
+   qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
     return self
 
   def _build_gpu_command(self, dev:QCOMDevice, hw_page:HCQBuffer|None=None) -> HCQBuffer:
@@ -135,29 +106,20 @@ class QCOMComputeQueue(HWQueue):
       hw_page = dev.cmd_buf.offset(int(hw_addr - dev.cmd_buf.va_addr), size)
     hw_page.cpu_view().view(size=size, fmt='I')[:] = array.array('I', self._q)
     return hw_page
+
   def bind(self, dev:QCOMDevice):
-    self.binded_device = dev
     self.hw_page = self._build_gpu_command(dev, dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True)))
-    self.prepared_submit = None if self._buffers is not None and any(x is not None for x in self._buffers.values()) \
-      else dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
-    self.prepared_submit_key = None if self.prepared_submit is None else self._submit_key(dev)
+    self.binded_device = dev
+    self.prepared_submit = dev.iface.prepare_submit(self.hw_page, len(self._q) * 4)
     # From now on, the queue is on the device for faster submission.
     self._q = self.hw_page.cpu_view().view(fmt='I')
 
   def _submit(self, dev:QCOMDevice):
-    if self.binded_device == dev:
-      submit_key = self._submit_key(dev)
-      if self.prepared_submit is None or self.prepared_submit_key != submit_key:
-        self.prepared_submit = dev.iface.prepare_submit(self.hw_page, len(self._q) * 4, self._resolve_submit_buffers())
-        self.prepared_submit_key = submit_key
-      prepared = self.prepared_submit
-    else: prepared = dev.iface.prepare_submit(self._build_gpu_command(dev), len(self._q) * 4, self._resolve_submit_buffers())
+    prepared = self.prepared_submit if self.binded_device == dev else dev.iface.prepare_submit(self._build_gpu_command(dev), len(self._q) * 4)
     dev.last_cmd = dev.iface.submit(prepared)
 
   def exec(self, prg:QCOMProgram, args_state:QCOMArgsState, global_size, local_size):
     self.bind_args_state(args_state)
-    self._add_buffers(args_state.buf, prg.lib_gpu, prg.dev._stack, *args_state.bufs)
-    if prg.samp_cnt > 0: self._add_buffers(prg.dev.border_color_buf)
 
     def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
@@ -381,7 +343,6 @@ def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, 
 
 class KGSLIface:
   count = 1
-  submit_requires_buffers = False
   renderers = [QCOMCLRenderer, IR3Renderer]
 
   def __init__(self, dev:QCOMDevice, device_id:int):
@@ -433,7 +394,7 @@ class KGSLIface:
       kgsl.IOCTL_KGSL_GPUOBJ_FREE(self.fd, id=mem.meta[0].id)
       FileIOInterface.munmap(mem.va_addr, mem.meta[0].mmapsize)
 
-  def prepare_submit(self, command:HCQBuffer, size:int, _buffers:set[HCQBuffer]):
+  def prepare_submit(self, command:HCQBuffer, size:int):
     obj = kgsl.struct_kgsl_command_object(gpuaddr=command.va_addr, size=size, flags=kgsl.KGSL_CMDLIST_IB)
     req = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(obj), numcmds=1, context_id=self.ctx,
                                        cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object))
@@ -453,39 +414,53 @@ class KGSLIface:
 class MSMAllocation:
   handle: int
   iova: int
+  size: int
   mapped_size: int
   cpu_addr: int
 
+def _close_file(fd:FileIOInterface):
+  os.close(fd.fd)
+  del fd.fd
+
 def _open_msm_render_node(path:str) -> tuple[FileIOInterface, int]|None:
+  fd = FileIOInterface(path, os.O_RDWR)
   try:
-    fd = FileIOInterface(path, os.O_RDWR)
     name = (ctypes.c_ubyte * msm_drm.DRM_CLIENT_NAME_MAX_LEN)()
     version = msm_drm.DRM_IOCTL_VERSION(fd, name_len=len(name), name=name)
-    if bytes(name[:version.name_len]) != b"msm": return None
+    if bytes(name[:version.name_len]) != b"msm":
+      _close_file(fd)
+      return None
     chip_id = msm_drm.DRM_IOCTL_MSM_GET_PARAM(fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID).value
     return fd, chip_id
-  except OSError: return None
+  except Exception:
+    _close_file(fd)
+    raise
 
 class MSMIface:
   count = 1
-  submit_requires_buffers = True
   renderers = [IR3Renderer]
 
   def __init__(self, dev:QCOMDevice, device_id:int):
     if device_id != 0: raise RuntimeError(f"QCOM:{device_id} does not exist (1 MSM DRM device available)")
-    self.dev = dev
+    self.dev, last_error = dev, None
     for path in sorted(glob.glob("/dev/dri/renderD*")):
-      if (node:=_open_msm_render_node(path)) is not None:
-        fd, chip_id = node
-        gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
-        if gpu_id != (6, 3, 0): continue
-        self.fd, self.chip_id, self.gpu_id = fd, chip_id, gpu_id
-        break
-    else: raise RuntimeError("No MSM DRM render node found")
+      try: node = _open_msm_render_node(path)
+      except OSError as e:
+        last_error = e
+        continue
+      if node is None: continue
+      fd, chip_id = node
+      gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
+      if gpu_id != (6, 3, 0):
+        _close_file(fd)
+        continue
+      self.fd, self.chip_id, self.gpu_id = fd, chip_id, gpu_id
+      break
+    else:
+      if last_error is not None: raise RuntimeError("Failed to open MSM DRM render node") from last_error
+      raise RuntimeError("No A630 MSM DRM render node found")
 
-    self.queue_id = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=0).id
     self.allocations:dict[int, MSMAllocation] = {}
-    self.allocation_generation = 0
     self.fault_count = self._fault_count()
     self.sysprof_enabled = False
     if PROFILE: self._set_sysprof(2)
@@ -494,29 +469,28 @@ class MSMIface:
     return msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_FAULTS).value
 
   def _set_sysprof(self, value:int):
-    msm_drm.DRM_IOCTL_MSM_SET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_SYSPROF, value=value)
+    try: msm_drm.DRM_IOCTL_MSM_SET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_SYSPROF, value=value)
+    except OSError as e:
+      if value and e.errno in {errno.EPERM, errno.EACCES}: raise RuntimeError("MSM profiling requires CAP_SYS_ADMIN") from e
+      raise
     self.sysprof_enabled = value != 0
 
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
     mapped_size = round_up(size, mmap.PAGESIZE)
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
-    cpu_addr = None
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE)
+    cpu_addr = 0
     try:
       iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
       cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
-      view = MMIOInterface(cpu_addr, size)
+      view = MMIOInterface(cpu_addr, size, fmt='B')
       if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
-    except Exception as e:
-      cleanup_error = RuntimeError(f"Failed to unmap MSM GEM handle {gem.handle}") \
-        if cpu_addr is not None and self.fd.munmap(cpu_addr, mapped_size) != 0 else None
-      try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=gem.handle)
-      except OSError as close_error: raise RuntimeError(f"Failed to close MSM GEM handle {gem.handle} during allocation cleanup") from close_error
-      if cleanup_error is not None: raise cleanup_error from e
+    except Exception:
+      if cpu_addr: self.fd.munmap(cpu_addr, mapped_size)
+      with contextlib.suppress(OSError): msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=gem.handle)
       raise
-
-    allocation = MSMAllocation(gem.handle, iova, mapped_size, cpu_addr)
+    allocation = MSMAllocation(gem.handle, iova, size, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
     return HCQBuffer(iova, size, meta=allocation, view=view, owner=self.dev)
 
@@ -528,65 +502,52 @@ class MSMIface:
     try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
     self.allocations.pop(allocation.handle)
-    self.allocation_generation += 1
     if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
-  def _resolve_allocation(self, mem:HCQBuffer) -> MSMAllocation:
-    if isinstance(allocation:=mem.base.meta, MSMAllocation):
-      if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
-      return allocation
-    if not isinstance(mem.va_addr, int): raise RuntimeError("MSM buffer address must be resolved before submission")
-    matches = [allocation for allocation in self.allocations.values()
-               if allocation.iova <= mem.va_addr and mem.va_addr + mem.size <= allocation.iova + allocation.mapped_size]
-    if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
-    return matches[0]
+  def _allocation(self, mem:HCQBuffer) -> MSMAllocation:
+    if not isinstance(allocation:=mem.base.meta, MSMAllocation) or self.allocations.get(allocation.handle) is not allocation:
+      raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    return allocation
 
-  def prepare_submit(self, command:HCQBuffer, size:int, buffers:set[HCQBuffer]):
+  def prepare_submit(self, command:HCQBuffer, size:int):
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
-    command_allocation = self._resolve_allocation(command)
-    command_offset = int(command.va_addr) - command_allocation.iova
+    allocation = self._allocation(command)
+    command_offset = int(command.va_addr) - allocation.iova
     if command_offset % 4: raise ValueError(f"MSM command offset must be a multiple of 4, got {command_offset}")
-    if command_offset < 0 or size > command.size or command_offset + size > command_allocation.mapped_size:
+    if command_offset < 0 or size > command.size or command_offset + size > allocation.size:
       raise ValueError("MSM command range is outside its buffer")
-
-    submit_allocations = {command_allocation.handle:command_allocation}
-    submit_allocations.update((allocation.handle, allocation) for allocation in map(self._resolve_allocation, buffers))
-    allocations = list(submit_allocations.values())
-    flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
-    bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(allocations))(*[
-      msm_drm.struct_drm_msm_gem_submit_bo(flags=flags, handle=allocation.handle, presumed=allocation.iova) for allocation in allocations])
-    cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(
-      msm_drm.struct_drm_msm_gem_submit_cmd(type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
-    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=len(bos), nr_cmds=1,
-                                               bos=ctypes.addressof(bos), cmds=ctypes.addressof(cmds), queueid=self.queue_id)
+    bos = (msm_drm.struct_drm_msm_gem_submit_bo * 1)(msm_drm.struct_drm_msm_gem_submit_bo(
+      flags=msm_drm.MSM_SUBMIT_BO_READ, handle=allocation.handle, presumed=allocation.iova))
+    cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(msm_drm.struct_drm_msm_gem_submit_cmd(
+      type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
+    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=1, nr_cmds=1,
+                                     bos=ctypes.addressof(bos), cmds=ctypes.addressof(cmds), queueid=0)
     return submit, bos, cmds
 
   def submit(self, prepared) -> int:
     msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
     return prepared[0].fence
 
-  def sleep(self, _time_spent_since_last_sleep_ms:int):
-    time.sleep(MSM_SIGNAL_POLL_SECONDS)
+  def sleep(self, _time_spent_since_last_sleep_ms:int): time.sleep(0.0001)
 
   def on_device_hang(self):
     fault_count, previous_fault_count = self._fault_count(), self.fault_count
     self.fault_count = fault_count
-    if fault_count > previous_fault_count: raise RuntimeError(f"MSM GPU faults increased from {previous_fault_count} to {fault_count}")
+    if fault_count > previous_fault_count:
+      self.dev.error_state = error = RuntimeError(f"MSM GPU faults increased from {previous_fault_count} to {fault_count}")
+      raise error
 
   def profile_finalize(self):
     if self.sysprof_enabled: self._set_sysprof(0)
 
-  def device_fini(self):
-    if (queue_id:=getattr(self, "queue_id", None)) is None: return
-    msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, queue_id)
-    self.queue_id = None
+  def device_fini(self): pass
 
 class QCOMDevice(HCQCompiled):
   ifaces = [KGSLIface, MSMIface]
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
-    self.iface = self._select_iface()
+    self.iface = self._select_iface(device)
     self.gpu_id = self.iface.gpu_id
 
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
