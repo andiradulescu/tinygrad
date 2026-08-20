@@ -1,5 +1,5 @@
-import ctypes, sys, unittest
-from unittest.mock import Mock
+import ctypes, mmap, sys, unittest
+from unittest.mock import Mock, patch
 from tinygrad.runtime.autogen import msm_drm
 from tinygrad.runtime.support.hcq import HCQBuffer, MMIOInterface
 
@@ -27,27 +27,56 @@ class TestMSMDRMUAPI(unittest.TestCase):
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestQCOMCommandBuffer(unittest.TestCase):
   def test_cpu_view(self):
-    from tinygrad.runtime.ops_qcom import QCOMComputeQueue
+    from tinygrad.runtime.ops_qcom import KGSLIface, QCOMComputeQueue
     gpu_mem = (ctypes.c_uint32 * 2)(0xaaaaaaaa, 0xaaaaaaaa)
     cpu_mem = (ctypes.c_uint32 * 2)()
     cmd_buf = HCQBuffer(ctypes.addressof(gpu_mem), 8, view=MMIOInterface(ctypes.addressof(cpu_mem), 8))
-    dev = Mock(ctx=0, cmd_buf=cmd_buf)
+    iface, dev = object.__new__(KGSLIface), Mock(ctx=0, cmd_buf=cmd_buf)
+    iface.ctx, dev.iface = 0, iface
+    dev.cmd_buf_allocator.alloc.return_value = cmd_buf.va_addr + 4
     queue = QCOMComputeQueue(dev)
     queue.q(0x12345678)
 
-    dev.cmd_buf_allocator.alloc.return_value = cmd_buf.va_addr + 4
-    _, obj = queue._build_gpu_command(dev)
+    page = queue._build_gpu_command(dev)
+    _, obj = iface.prepare_submit(page, 4)
     self.assertEqual(obj.gpuaddr, cmd_buf.va_addr + 4)
-    self.assertEqual(tuple(gpu_mem), (0xaaaaaaaa, 0xaaaaaaaa))
-    self.assertEqual(tuple(cpu_mem), (0, 0x12345678))
+    self.assertEqual((tuple(gpu_mem), tuple(cpu_mem)), ((0xaaaaaaaa, 0xaaaaaaaa), (0, 0x12345678)))
 
     dev.allocator.alloc.return_value = cmd_buf.offset(size=4)
     queue.bind(dev)
-    self.assertEqual(queue.obj.gpuaddr, cmd_buf.va_addr)
-    self.assertEqual(tuple(gpu_mem), (0xaaaaaaaa, 0xaaaaaaaa))
-    self.assertEqual(tuple(cpu_mem), (0x12345678, 0x12345678))
+    self.assertEqual(queue.hw_page.va_addr, cmd_buf.va_addr)
+    self.assertEqual((tuple(gpu_mem), tuple(cpu_mem)), ((0xaaaaaaaa, 0xaaaaaaaa), (0x12345678, 0x12345678)))
     queue._q[0] = 0x87654321
-    self.assertEqual(tuple(cpu_mem), (0x87654321, 0x12345678))
+    self.assertEqual((tuple(gpu_mem), tuple(cpu_mem)), ((0xaaaaaaaa, 0xaaaaaaaa), (0x87654321, 0x12345678)))
+
+@unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
+class TestMSMInterface(unittest.TestCase):
+  def test_private_allocation_and_submit(self):
+    from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
+    memory = (ctypes.c_ubyte * mmap.PAGESIZE)()
+    fd = Mock()
+    fd.mmap.return_value, fd.munmap.return_value = ctypes.addressof(memory), 0
+    iface = object.__new__(MSMIface)
+    iface.dev, iface.fd, iface.allocations = Mock(error_state=None), fd, {}
+
+    def gem_info(_fd, handle, info):
+      return Mock(value=0x10000000 if info == msm_drm.MSM_INFO_GET_IOVA else 0)
+
+    with (
+      patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_NEW', return_value=Mock(handle=7)) as gem_new,
+      patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', side_effect=gem_info),
+    ):
+      buf = iface.alloc(17)
+    allocation = buf.meta
+    self.assertIsInstance(allocation, MSMAllocation)
+    self.assertEqual((allocation.size, allocation.mapped_size), (17, mmap.PAGESIZE))
+    self.assertEqual(gem_new.call_args.kwargs['flags'], msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE)
+
+    submit, bos, cmds = iface.prepare_submit(buf.offset(4, 8), 8)
+    self.assertEqual((submit.nr_bos, submit.queueid), (1, 0))
+    self.assertEqual((bos[0].flags, bos[0].handle, bos[0].presumed), (msm_drm.MSM_SUBMIT_BO_READ, 7, 0x10000000))
+    self.assertEqual((cmds[0].submit_offset, cmds[0].size), (4, 8))
+    with self.assertRaisesRegex(ValueError, "outside its buffer"): iface.prepare_submit(buf.offset(16, 4), 4)
 
 if __name__ == '__main__':
   unittest.main()
