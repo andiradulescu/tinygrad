@@ -25,14 +25,8 @@ jobs:
       - name: Apply rewrite
         run: |
           git fetch origin automation/qcom-msm-explicit-bo-rewrite
-          git show origin/automation/qcom-msm-explicit-bo-rewrite:.github/workflows/qcom-msm-explicit-bo-rewrite.yml > /tmp/rewrite.yml
-          awk '
-            /- name: Rewrite MSM submission path/ { step=1; next }
-            step && /- name: Validate/ { exit }
-            step && /run: \|/ { run=1; next }
-            run { sub(/^          /, ""); print }
-          ' /tmp/rewrite.yml > /tmp/rewrite.sh
-          bash /tmp/rewrite.sh
+          git show origin/automation/qcom-msm-explicit-bo-rewrite:.github/qcom_msm_rewrite.py > /tmp/qcom_msm_rewrite.py
+          python3 /tmp/qcom_msm_rewrite.py
 
       - name: Validate
         run: |
