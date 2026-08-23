@@ -32,7 +32,7 @@ jobs:
         run: |
           git diff --check
           python3 -m compileall -q tinygrad/runtime/ops_qcom.py test/null/test_qcom.py
-          python3 test/null/test_qcom.py
+          PYTHONPATH=. python3 test/null/test_qcom.py
           python3 sz.py
 
       - name: Amend and force-push PR branch
