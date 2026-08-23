@@ -1,0 +1,51 @@
+name: Run QCOM MSM explicit BO rewrite
+
+on:
+  pull_request:
+    branches:
+      - review/qcom-msm-drm-pr2
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: review/qcom-msm-drm-pr2
+          fetch-depth: 0
+
+      - name: Verify target
+        run: |
+          test "$(git rev-parse HEAD)" = "287723cdd7633ba3d6e479c5a5870412fa6551ed"
+          test "$(git rev-list --count origin/review/qcom-cpu-view-prereq..HEAD)" = "2"
+
+      - name: Apply rewrite
+        run: |
+          git fetch origin automation/qcom-msm-explicit-bo-rewrite
+          git show origin/automation/qcom-msm-explicit-bo-rewrite:.github/workflows/qcom-msm-explicit-bo-rewrite.yml > /tmp/rewrite.yml
+          awk '
+            /- name: Rewrite MSM submission path/ { step=1; next }
+            step && /- name: Validate/ { exit }
+            step && /run: \|/ { run=1; next }
+            run { sub(/^          /, ""); print }
+          ' /tmp/rewrite.yml > /tmp/rewrite.sh
+          bash /tmp/rewrite.sh
+
+      - name: Validate
+        run: |
+          git diff --check
+          python3 -m compileall -q tinygrad/runtime/ops_qcom.py test/null/test_qcom.py
+          python3 test/null/test_qcom.py
+          python3 sz.py
+
+      - name: Amend and force-push PR branch
+        run: |
+          git config user.name "Andrei Radulescu"
+          git config user.email "andi.radulescu@gmail.com"
+          git add tinygrad/runtime/ops_qcom.py test/null/test_qcom.py
+          git commit --amend --no-edit
+          test "$(git rev-list --count origin/review/qcom-cpu-view-prereq..HEAD)" = "2"
+          git push --force-with-lease=refs/heads/review/qcom-msm-drm-pr2:287723cdd7633ba3d6e479c5a5870412fa6551ed origin HEAD:review/qcom-msm-drm-pr2
