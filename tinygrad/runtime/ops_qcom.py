@@ -71,6 +71,7 @@ class QCOMComputeQueue(HWQueue):
 
   def reg(self, reg: int, *vals: int): self.q(pkt4_hdr(reg, len(vals)), *vals)
 
+  # MSM GEM_SUBMIT requires every BO referenced by the command stream.
   def _add_buffers(self, *bufs:HCQBuffer):
     if self._buffers is None: return
     for buf in bufs:
@@ -489,15 +490,9 @@ class MSMIface:
 
     self.allocations:dict[int, MSMAllocation] = {}
     self.fault_count = self._fault_count()
-    self.sysprof_enabled = False
-    if PROFILE: self._set_sysprof(2)
 
   def _fault_count(self) -> int:
     return msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_FAULTS).value
-
-  def _set_sysprof(self, value:int):
-    msm_drm.DRM_IOCTL_MSM_SET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_SYSPROF, value=value)
-    self.sysprof_enabled = value != 0
 
   def alloc(self, size:int, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
@@ -523,10 +518,9 @@ class MSMIface:
   def free(self, mem:HCQBuffer):
     if not isinstance(allocation:=mem.base.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
     if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
-    try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
-    except OSError as e: raise RuntimeError(f"Failed to close MSM GEM handle {allocation.handle}") from e
+    self.fd.munmap(allocation.cpu_addr, allocation.mapped_size)
+    msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.allocations.pop(allocation.handle)
-    if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError(f"Failed to unmap MSM GEM handle {allocation.handle}")
 
   def _allocation(self, mem:HCQBuffer) -> MSMAllocation:
     if isinstance(allocation:=mem.base.meta, MSMAllocation):
@@ -573,8 +567,7 @@ class MSMIface:
       self.dev.error_state = error = RuntimeError(f"MSM GPU faults increased from {previous_fault_count} to {fault_count}")
       raise error
 
-  def profile_finalize(self):
-    if self.sysprof_enabled: self._set_sysprof(0)
+  def profile_finalize(self): pass
 
 class QCOMDevice(HCQCompiled):
   ifaces = [KGSLIface, MSMIface]

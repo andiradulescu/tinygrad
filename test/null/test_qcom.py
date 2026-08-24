@@ -48,6 +48,29 @@ class TestQCOMCommandBuffer(unittest.TestCase):
     queue._q[0] = 0x87654321
     self.assertEqual((tuple(gpu_mem), tuple(cpu_mem)), ((0xaaaaaaaa, 0xaaaaaaaa), (0x87654321, 0x12345678)))
 
+  def test_symbolic_submit_buffer_replacement(self):
+    from tinygrad.dtype import dtypes
+    from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface, QCOMComputeQueue
+    from tinygrad.uop.ops import UOp
+    memory = (ctypes.c_uint32 * 1)()
+    allocations = [MSMAllocation(handle, iova, size, size, ctypes.addressof(memory))
+                   for handle,iova,size in [(7, 0x10000000, 4), (9, 0x20000000, 32), (11, 0x30000000, 32)]]
+    command = HCQBuffer(allocations[0].iova, 4, meta=allocations[0], view=MMIOInterface(ctypes.addressof(memory), 4))
+    iface, dev, submitted = object.__new__(MSMIface), Mock(), []
+    iface.allocations = {allocation.handle:allocation for allocation in allocations}
+    iface.submit = lambda prepared: submitted.append([bo.handle for bo in prepared[1]]) or 0
+    dev.iface, dev.allocator.alloc.return_value = iface, command
+    address = UOp.variable("address", 0, 0xffffffffffffffff, dtype=dtypes.uint64)
+    queue = QCOMComputeQueue(dev)
+    queue._add_buffers(HCQBuffer(address, 32))
+    queue.q(0x12345678)
+    queue.bind(dev)
+
+    queue.submit(dev, {address.expr:0x20000000})
+    queue.submit(dev, {address.expr:0x30000000})
+
+    self.assertEqual(submitted, [[7, 9], [7, 11]])
+
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestMSMInterface(unittest.TestCase):
   def test_allocation_and_submit(self):
