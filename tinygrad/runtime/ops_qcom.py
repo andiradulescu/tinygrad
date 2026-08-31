@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, ctypes, functools, mmap, struct, array, math, sys, weakref, contextlib
 assert sys.platform != 'win32'
-from typing import Any, cast
+from typing import Any
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
@@ -101,9 +101,13 @@ class QCOMComputeQueue(HWQueue):
              qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
     return self
 
-  def _build_gpu_command(self, dev:QCOMDevice, hw_addr=None):
-    to_mv((hw_page_addr:=hw_addr or dev.cmd_buf_allocator.alloc(len(self._q) * 4)), len(self._q) * 4).cast('I')[:] = array.array('I', self._q)
-    obj = kgsl.struct_kgsl_command_object(gpuaddr=hw_page_addr, size=len(self._q) * 4, flags=kgsl.KGSL_CMDLIST_IB)
+  def _build_gpu_command(self, dev:QCOMDevice, hw_page=None):
+    size = len(self._q) * 4
+    if hw_page is None:
+      hw_addr = dev.cmd_buf_allocator.alloc(size)
+      hw_page = dev.cmd_buf.offset(int(hw_addr - dev.cmd_buf.va_addr), size)
+    hw_page.cpu_view().view(size=size, fmt='I')[:] = array.array('I', self._q)
+    obj = kgsl.struct_kgsl_command_object(gpuaddr=hw_page.va_addr, size=size, flags=kgsl.KGSL_CMDLIST_IB)
     submit_req = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(obj), numcmds=1, context_id=dev.ctx,
                                               cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object))
     return submit_req, obj
@@ -111,9 +115,9 @@ class QCOMComputeQueue(HWQueue):
   def bind(self, dev:QCOMDevice):
     self.binded_device = dev
     self.hw_page = dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True))
-    self.submit_req, self.obj = self._build_gpu_command(self.binded_device, self.hw_page.va_addr)
+    self.submit_req, self.obj = self._build_gpu_command(self.binded_device, self.hw_page)
     # From now on, the queue is on the device for faster submission.
-    self._q = to_mv(self.obj.gpuaddr, len(self._q) * 4).cast("I")
+    self._q = self.hw_page.cpu_view().view(fmt='I')
 
   def _submit(self, dev:QCOMDevice):
     if self.binded_device == dev: submit_req = self.submit_req
@@ -150,7 +154,7 @@ class QCOMComputeQueue(HWQueue):
              qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=prg.pvtmem_size_per_item), *data64_le(prg.dev._stack.va_addr),
              qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=prg.pvtmem_size_total))
 
-    if prg.NIR and prg.wgsz != 0xfc: to_mv(int(args_state.buf.va_addr) + prg.wgsz * 4, 12)[:] = struct.pack("III", *local_size)
+    if prg.NIR and prg.wgsz != 0xfc: args_state.buf.cpu_view().view(offset=prg.wgsz * 4, size=12)[:] = struct.pack("III", *local_size)
     self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
                                                              state_block=mesa.SB6_CS_SHADER, num_unit=1024 // 4),
              *data64_le(args_state.buf.va_addr))
@@ -201,16 +205,16 @@ class QCOMComputeQueue(HWQueue):
 class QCOMArgsState(HCQArgsState):
   def __init__(self, buf:HCQBuffer, prg:QCOMProgram, bufs:tuple[HCQBuffer, ...], vals:tuple[int, ...]=()):
     super().__init__(buf, prg, bufs, vals=vals)
-    ctypes.memset(int(self.buf.va_addr), 0, prg.kernargs_alloc_size)
+    ctypes.memset(self.buf.cpu_view().addr, 0, prg.kernargs_alloc_size)
 
     ubos = [bufs[slot] for _,slot,_,shape in prg.signature if slot < len(bufs) and not is_image_shape(shape)]
     uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in prg.signature if slot < len(bufs) and is_image_shape(shape)]
     # NIR can reorder images to different texture slots
     ibos, texs = uavs[:prg.ibo_cnt], [uavs[prg.ibo_cnt + (prg.tex_to_image[i] if prg.NIR else i)] for i in range(prg.tex_cnt)]
     for cnst_val,cnst_off,cnst_sz in prg.consts_info:
-      to_mv(cast(int, self.buf.va_addr) + cnst_off, cnst_sz)[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
+      self.buf.cpu_view().view(offset=cnst_off, size=cnst_sz)[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
 
-    if prg.samp_cnt > 0: to_mv(int(self.buf.va_addr) + prg.samp_off, len(prg.samplers) * 4).cast('I')[:] = array.array('I', prg.samplers)
+    if prg.samp_cnt > 0: self.buf.cpu_view().view(offset=prg.samp_off, size=len(prg.samplers) * 4, fmt='I')[:] = array.array('I', prg.samplers)
     if prg.NIR:
       self.bind_sints_to_buf(*[b.va_addr for b in ubos], buf=self.buf, fmt='Q', offset=prg.buf_off)
       for v,(o,dt) in zip(vals, TinyELF.iter_sig(prg.signature[len(bufs):], len(ubos)*8)):
@@ -260,7 +264,7 @@ class QCOMProgram(HCQProgram['QCOMDevice']):
     else: self._parse_lib(obj.lib)
 
     self.lib_gpu: HCQBuffer = self.dev.allocator.alloc(self.image_size, buf_spec:=BufferSpec(cpu_access=True, nolru=True))
-    to_mv(self.lib_gpu.va_addr, self.image_size)[:] = self.image
+    self.lib_gpu.cpu_view().view(size=self.image_size)[:] = self.image
 
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
     self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
