@@ -37,7 +37,7 @@ x = (tiny_tensor1 + 1).realize()
 
 ### `QCOM` OpenCL Interoperability
 
-tinygrad supports OpenCL interoperability on `QCOM` backend.
+tinygrad supports OpenCL interoperability on `QCOM` backend when using the KGSL interface. The MSM DRM interface does not support importing external pointers.
 
 Buffer interop allows direct access to OpenCL memory buffers:
 ```python

@@ -172,7 +172,7 @@ class TestHCQ(unittest.TestCase):
 
     zb = Buffer(Device.DEFAULT, 3 * 3 * 3, dtypes.int, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
     zt = Buffer(Device.DEFAULT, 3 * 3 * 3, dtypes.int, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
-    ctypes.memset(zb._buf.va_addr, 0, zb.nbytes)
+    ctypes.memset(zb._buf.cpu_view().addr, 0, zb.nbytes)
     kernargs = runtime.fill_kernargs([zt._buf, zb._buf])
 
     q = TestHCQ.d0.hw_compute_queue_t()
@@ -183,7 +183,7 @@ class TestHCQ(unittest.TestCase):
     for x in range(1, 4):
       for y in range(1, 4):
         for z in range(1, 4):
-          ctypes.memset(zt._buf.va_addr, 0, zb.nbytes)
+          ctypes.memset(zt._buf.cpu_view().addr, 0, zb.nbytes)
 
           q.submit(TestHCQ.d0, {virt_val.expr: TestHCQ.d0.timeline_value, virt_local[0].expr: x, virt_local[1].expr: y, virt_local[2].expr: z})
           TestHCQ.d0.timeline_signal.wait(TestHCQ.d0.timeline_value)
@@ -212,7 +212,7 @@ class TestHCQ(unittest.TestCase):
     sz = 64 << 20
     buf1 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(nolru=True)).ensure_allocated()
     buf2 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
-    ctypes.memset(buf2._buf.va_addr, 1, sz)
+    ctypes.memset(buf2._buf.cpu_view().addr, 1, sz)
 
     TestHCQ.d0.hw_copy_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
                                 .copy(buf1._buf, buf2._buf, sz) \
@@ -222,7 +222,7 @@ class TestHCQ(unittest.TestCase):
     TestHCQ.d0.timeline_value += 1
 
     mv_buf1 = buf1.as_memoryview().cast('Q')
-    assert libc.memcmp(mv_address(mv_buf1), buf2._buf.va_addr, sz) == 0
+    assert libc.memcmp(mv_address(mv_buf1), buf2._buf.cpu_view().addr, sz) == 0
 
   @slow
   def test_copy_64bit(self):
@@ -233,7 +233,7 @@ class TestHCQ(unittest.TestCase):
       buf1 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(nolru=True)).ensure_allocated()
       buf2 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
 
-      ctypes.memset(buf2._buf.va_addr, 0x3e, sz)
+      ctypes.memset(buf2._buf.cpu_view().addr, 0x3e, sz)
       buf2_q_view = buf2._buf.cpu_view().view(fmt='Q')
       for i in range(0, sz//8, 0x1000):
         for j in range(32): buf2_q_view[min(max(i + j - 16, 0), (sz // 8) - 1)] = random.randint(0, 0xffffffffffffffff)
@@ -246,7 +246,7 @@ class TestHCQ(unittest.TestCase):
       TestHCQ.d0.timeline_value += 1
 
       mv_buf1 = buf1.as_memoryview()
-      assert libc.memcmp(mv_address(mv_buf1), buf2._buf.va_addr, sz) == 0
+      assert libc.memcmp(mv_address(mv_buf1), buf2._buf.cpu_view().addr, sz) == 0
 
   def test_update_copy(self):
     if TestHCQ.d0.hw_copy_queue_t is None: self.skipTest("device does not support copy queue")
@@ -275,7 +275,7 @@ class TestHCQ(unittest.TestCase):
     sz = 64 << 20
     buf1 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(nolru=True)).ensure_allocated()
     buf2 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
-    ctypes.memset(buf2._buf.va_addr, 1, sz)
+    ctypes.memset(buf2._buf.cpu_view().addr, 1, sz)
 
     q = TestHCQ.d0.hw_copy_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
                                     .copy(HCQBuffer(virt_dest_addr, sz), HCQBuffer(virt_src_addr, sz), sz) \
@@ -423,7 +423,7 @@ class TestHCQ(unittest.TestCase):
     buf2 = Buffer(Device.DEFAULT, 1, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
 
     for i in range(256):
-      ctypes.memset(buf2._buf.va_addr, i, 1)
+      ctypes.memset(buf2._buf.cpu_view().addr, i, 1)
 
       TestHCQ.d0.hw_copy_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
                                   .copy(buf1._buf, buf2._buf, 1) \
@@ -441,7 +441,7 @@ class TestHCQ(unittest.TestCase):
     buf3 = Buffer(Device.DEFAULT, 1, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
 
     for i in range(256):
-      ctypes.memset(buf3._buf.va_addr, i, 1)
+      ctypes.memset(buf3._buf.cpu_view().addr, i, 1)
 
       TestHCQ.d0.hw_copy_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
                                   .copy(buf1._buf, buf3._buf, 1) \
@@ -464,7 +464,7 @@ class TestHCQ(unittest.TestCase):
     TestHCQ.d0.allocator._map(buf2._buf)
 
     for i in range(256):
-      ctypes.memset(buf3._buf.va_addr, i, 1)
+      ctypes.memset(buf3._buf.cpu_view().addr, i, 1)
 
       TestHCQ.d0.hw_copy_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
                                   .copy(buf1._buf, buf3._buf, 1) \
@@ -487,7 +487,7 @@ class TestHCQ(unittest.TestCase):
     kernargs_ptr = runtime.fill_kernargs([buf1._buf, buf2._buf])
 
     for i in range(255):
-      ctypes.memset(buf2._buf.va_addr, i, 2)
+      ctypes.memset(buf2._buf.cpu_view().addr, i, 2)
 
       # Need memory_barrier after direct write to vram
       TestHCQ.d0.hw_compute_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
@@ -507,7 +507,7 @@ class TestHCQ(unittest.TestCase):
     buf3 = Buffer(Device.DEFAULT, 1, dtypes.int8, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
 
     for i in range(256):
-      ctypes.memset(buf3._buf.va_addr, i, 1)
+      ctypes.memset(buf3._buf.cpu_view().addr, i, 1)
 
       # Need memory_barrier after direct write to vram
       TestHCQ.d0.hw_compute_queue_t().wait(TestHCQ.d0.timeline_signal, TestHCQ.d0.timeline_value - 1) \
