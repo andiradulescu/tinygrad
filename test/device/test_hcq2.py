@@ -1,7 +1,7 @@
 import unittest, contextlib, ctypes, gc, struct, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer, Compiled
+from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context, dedup, partition, unwrap
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
@@ -112,6 +112,20 @@ class TestHCQ2Schedule(unittest.TestCase):
     ((device, index),) = call.arg.aux.slots
     self.assertEqual(device, Device.DEFAULT)
     self.assertEqual(call.src[1 + index].buffer.dtype, dtypes.uint64)
+
+  def test_profile_timestamps(self):
+    x, f = self.input(), TinyJit(lambda a: (a + 1).realize())
+    before = len(Compiled.profile_events)
+    with Context(PROFILE=1):
+      for _ in range(5): np.testing.assert_array_equal(f(x).numpy(), [3] * 4)
+    self.assertTrue(any(call_is_hcq(c) for c in f.captured.linear.src))
+    events = [e for e in Compiled.profile_events[before:] if isinstance(e, ProfileGraphEvent)]
+    times = [(e.sigs[x.st_id], e.sigs[x.en_id]) for e in events for x in e.ents]
+    self.assertTrue(times)
+    for st, en in times:
+      self.assertGreater(st, 0)
+      self.assertGreaterEqual(en, st)
+    self.assertTrue(any(en > st for st, en in times))
 
   def test_large_eager_not_cached(self):
     _, compiled, inputs = self.compiled(65)
