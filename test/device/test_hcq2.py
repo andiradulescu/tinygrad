@@ -118,6 +118,7 @@ class TestHCQ2Schedule(unittest.TestCase):
     before = len(Compiled.profile_events)
     with Context(PROFILE=1):
       for _ in range(5): np.testing.assert_array_equal(f(x).numpy(), [3] * 4)
+      Device[Device.DEFAULT].synchronize()
     self.assertTrue(any(call_is_hcq(c) for c in f.captured.linear.src))
     events = [e for e in Compiled.profile_events[before:] if isinstance(e, ProfileGraphEvent)]
     times = [(e.sigs[x.st_id], e.sigs[x.en_id]) for e in events for x in e.ents]
