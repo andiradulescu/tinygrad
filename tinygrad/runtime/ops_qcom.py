@@ -288,6 +288,10 @@ class QCOMAllocator(Allocator['QCOMDevice']):
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
     self.dev.iface.free(storage)
+  def _map(self, buf:Buffer) -> BufferStorage:
+    if buf.device.split(":")[0] not in {"CPU", "PYTHON", "NPY"}: raise RuntimeError(f"Cannot map {buf.device} on {self.dev.device}")
+    return self.dev.iface.map(buf._buf, buf.nbytes)
+  def _unmap(self, storage:BufferStorage): self.dev.iface.free(storage)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
