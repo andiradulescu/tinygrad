@@ -201,10 +201,14 @@ def _prepare_jit_inputs(args, kwargs):
   if any(u.is_virtual for u in get_input_uops()): raise JitError("JIT inputs must be real buffers; use .clone()")
   if len(unrealized_tensors := [x for x in tensors if not x.uop.is_realized]): Tensor.realize(*unrealized_tensors)
   input_uops = get_input_uops()
+  # Realizing a contiguous view can leave a COPY alias. Capture its storage, including any surrounding movement ops.
+  for i, u in enumerate(input_uops):
+    while (base:=u.base).op is Ops.COPY: u = u.substitute({base:base.src[0]})
+    input_uops[i] = u
   # collect buffer UOps (including MultiBuffer)
   input_buf_uops: list[UOp] = [u.base for u in input_uops if u.base.realized is not None]
   if len(set(input_buf_uops)) != len(input_buf_uops): raise JitError("duplicate inputs to JIT")
-  inputs = [(*(u.substitute({u.base:UOp(Ops.NOOP)}, extra_pm=mop_cleanup).unbind_all()), u.dtype, u.device) for u in input_uops]
+  inputs = [(*(graph_rewrite(u, mop_cleanup).substitute({u.base:UOp(Ops.NOOP)}).unbind_all()), u.dtype, u.device) for u in input_uops]
   _var_vals = merge_dicts([x[1] for x in inputs] + [dict(v.unbind() for v in (args + tuple(kwargs.values())) if isinstance(v, UOp))])
   var_vals = {k.expr:v for k,v in _var_vals.items()}
   expected_input_info = [(x[0], tuple(sorted(x[1].keys(), key=lambda v: v.expr)), x[2], x[3]) for x in inputs]
