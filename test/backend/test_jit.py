@@ -23,6 +23,22 @@ class TestJit(unittest.TestCase):
       x = (Tensor.arange(10).float() + i * 10).clone().realize()
       np.testing.assert_allclose(f(x).numpy(), x.numpy()[2:5] + 1)
 
+  def test_jit_realized_contiguous_input_view(self):
+    for offset in (0, 17):
+      for reshape in (False, True):
+        with self.subTest(offset=offset, reshape=reshape):
+          values = [np.arange(274, dtype=np.float32) + i * 1000 for i in range(2)]
+          bases = [Tensor(v).realize() for v in values]
+          views = [b[offset:offset+257].contiguous().realize() for b in bases]
+          for view, base in zip(views, bases):
+            if Device.DEFAULT in {"CL", "WEBGPU"}: self.assertIsNot(view.uop.buffer.base, base.uop.buffer)
+            else: self.assertIs(view.uop.buffer.base, base.uop.buffer)
+          if reshape: views = [v.reshape(257, 1) for v in views]
+          f = TinyJit(lambda x: (x * 2 + 1).contiguous().realize())
+          for i in range(6):
+            expected = values[i % 2][offset:offset+257] * 2 + 1
+            np.testing.assert_array_equal(f(views[i % 2]).numpy(), expected.reshape(257, 1) if reshape else expected)
+
   @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, X86Renderer), "estimates are wrong for x86")
   def test_global_counters_jit(self):
     @TinyJit
