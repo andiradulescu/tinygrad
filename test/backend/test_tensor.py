@@ -7,6 +7,7 @@ from extra.gradcheck import numerical_jacobian, jacobian, gradcheck
 from hypothesis import given, settings, strategies as strat
 from tinygrad.dtype import DTYPES_DICT
 from tinygrad.uop.ops import UOp
+from tinygrad.renderer.llvmir import CPULLVMRenderer
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
@@ -782,6 +783,15 @@ class TestTensorCreationDevice(unittest.TestCase):
     y = Tensor([1, 2, 3]).to("CPU")
     x = y.one_hot(10)
     x.realize()
+
+class TestBufferViewAlignment(unittest.TestCase):
+  @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, CPULLVMRenderer), "the LLVM renderer declares global pointers align 32")
+  @unittest.expectedFailure
+  def test_view_pointer_is_aligned(self):
+    # a kernel reading this view gets base + 68 bytes, its aligned vector loads segfault on x86
+    base = Tensor(np.arange(274, dtype=np.float32)).realize()
+    view = base[17:274].contiguous().realize()
+    self.assertEqual(view.uop.buffer._buf % 32, 0)
 
 if __name__ == '__main__':
   unittest.main()
