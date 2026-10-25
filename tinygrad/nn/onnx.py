@@ -656,7 +656,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Conv(X: Tensor, W: Tensor, B:Tensor|None=None, auto_pad:AUTO_PAD_OPTIONS="NOTSET", dilations:tuple[int, ...]|int=1, group:int=1,
           kernel_shape:tuple[int, ...]|None=None, pads:tuple[int, ...]|int=0, strides:tuple[int, ...]|int=1):
     return X.conv2d(W, B, stride=strides, groups=group, dilation=dilations,
-                    padding=_resolve_pool_pads(X, pads, kernel_shape or W.shape[2:], dilations, strides, auto_pad))
+                    padding=_resolve_pool_pads(X, pads, kernel_shape or W.shape[2:], dilations, strides, auto_pad)).cast(X.dtype)
 
   def ConvTranspose(X: Tensor, W: Tensor, B:Tensor|None=None, auto_pad:AUTO_PAD_OPTIONS="NOTSET", dilations:tuple[int, ...]|int=1, group:int=1,
                     kernel_shape:tuple[int, ...]|None=None, pads:Sequence[int]|None=None, output_shape:Sequence[int]|None=None,
@@ -684,10 +684,12 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def GlobalAveragePool(X:Tensor): return X.mean(axis=tuple(range(2, X.ndim)), keepdim=True)
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
 
+  def MatMul(A:Tensor, B:Tensor): return A.matmul(B).cast(A.dtype)
+
   def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
     ret = alpha * (A.transpose(transA) @ B.transpose(transB))
     if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
-    return ret
+    return ret.cast(A.dtype)
 
   def Einsum(*Inputs:Tensor, equation:str): return Tensor.einsum(equation, *Inputs)
 

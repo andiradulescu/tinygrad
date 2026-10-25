@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import unittest
 import numpy as np
+from tinygrad import Tensor, dtypes
 from tinygrad.nn.onnx import OnnxRunner
 from tinygrad.device import Device
 from tinygrad.helpers import fetch, Context
@@ -19,6 +20,42 @@ def run_onnx_torch(onnx_model, inputs):
 np.random.seed(1337)
 
 class TestOnnxModel(unittest.TestCase):
+  def test_conv_image_dtype(self):
+    import onnx
+    for dtype, onnx_dtype in [(np.float16, onnx.TensorProto.FLOAT16), (np.float32, onnx.TensorProto.FLOAT)]:
+      with self.subTest(dtype=dtype), Context(IMAGE=1, FLOAT16=1):
+        graph = onnx.helper.make_graph([onnx.helper.make_node("Conv", ["X", "W", "B"], ["Y"])], "conv", [
+          onnx.helper.make_tensor_value_info("X", onnx_dtype, (1, 4, 2, 2))], [
+          onnx.helper.make_tensor_value_info("Y", onnx_dtype, (1, 4, 2, 2))], [
+          onnx.numpy_helper.from_array(np.ones((4, 4, 1, 1), dtype=dtype), "W"),
+          onnx.numpy_helper.from_array(np.array([0.125, 0.25, 0.5, 1], dtype=dtype), "B")])
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+        runner = OnnxRunner(Tensor(model.SerializeToString(), device="PYTHON"))
+        out = runner({"X": Tensor(np.arange(16, dtype=dtype).reshape(1, 4, 2, 2))})["Y"]
+        self.assertEqual(out.dtype, dtypes.float16 if dtype is np.float16 else dtypes.float32)
+        expected = np.array([[[[24.125, 28.125], [32.125, 36.125]], [[24.25, 28.25], [32.25, 36.25]],
+                              [[24.5, 28.5], [32.5, 36.5]], [[25, 29], [33, 37]]]], dtype=dtype)
+        np.testing.assert_array_equal(out.numpy(), expected)
+
+  def test_matmul_gemm_image_dtype(self):
+    import onnx
+    for op in ("MatMul", "Gemm"):
+      for dtype, onnx_dtype in [(np.float16, onnx.TensorProto.FLOAT16), (np.float32, onnx.TensorProto.FLOAT)]:
+        with self.subTest(op=op, dtype=dtype), Context(IMAGE=1, FLOAT16=1):
+          names = ["X", "W"] if op == "MatMul" else ["X", "W", "B"]
+          initializers = [onnx.numpy_helper.from_array(np.ones((4, 4), dtype=dtype), "W")]
+          if op == "Gemm": initializers.append(onnx.numpy_helper.from_array(np.full(4, 0.5, dtype=dtype), "B"))
+          graph = onnx.helper.make_graph([onnx.helper.make_node(op, names, ["Y"])], op, [
+            onnx.helper.make_tensor_value_info("X", onnx_dtype, (4, 4))], [
+            onnx.helper.make_tensor_value_info("Y", onnx_dtype, (4, 4))], initializers)
+          model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+          runner = OnnxRunner(Tensor(model.SerializeToString(), device="PYTHON"))
+          out = runner({"X": Tensor(np.arange(16, dtype=dtype).reshape(4, 4))})["Y"]
+          self.assertEqual(out.dtype, dtypes.float16 if dtype is np.float16 else dtypes.float32)
+          expected = [[6, 6, 6, 6], [22, 22, 22, 22], [38, 38, 38, 38], [54, 54, 54, 54]] if op == "MatMul" else [
+            [6.5, 6.5, 6.5, 6.5], [22.5, 22.5, 22.5, 22.5], [38.5, 38.5, 38.5, 38.5], [54.5, 54.5, 54.5, 54.5]]
+          np.testing.assert_array_equal(out.numpy(), np.array(expected, dtype=dtype))
+
   @unittest.skip("slow")
   def test_efficientnet(self):
     input_name, input_new = "images:0", True
