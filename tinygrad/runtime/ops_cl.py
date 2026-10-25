@@ -88,6 +88,9 @@ class CLAllocator(HostAllocator):
   def __init__(self, dev:CLDevice):
     super().__init__(dev)
     self.sub_buffers:dict[int, dict[tuple[int, int], cl.cl_mem]] = {}
+    alignment = ctypes.c_uint32()
+    check(cl.clGetDeviceInfo(dev.cl_dev, cl.CL_DEVICE_MEM_BASE_ADDR_ALIGN, 4, ctypes.byref(alignment), None))
+    self.alignment = max(1, alignment.value // 8)
 
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.host or options.cpu_access: return super()._alloc(size, options)
@@ -103,13 +106,28 @@ class CLAllocator(HostAllocator):
 
   def _offset(self, buf:int, size:int, offset:int) -> int:
     if buf not in self.sub_buffers: return super()._offset(buf, size, offset)
+    if offset == 0: return buf
+    if offset % self.alignment: check(cl.CL_MISALIGNED_SUB_BUFFER_OFFSET)
     if (size, offset) not in (views:=self.sub_buffers[buf]):
       region = cl.cl_buffer_region(origin=offset, size=size)
       views[size, offset] = checked(cl.clCreateSubBuffer, ctypes.cast(buf, cl.cl_mem), cl.CL_MEM_READ_WRITE,
                                    cl.CL_BUFFER_CREATE_TYPE_REGION, ctypes.byref(region))
     return int.from_bytes(bytes(views[size, offset]), "little")
   def _copy(self, fn, name:str, mem:int, host, size:int): # blocking, so the host memory can go
-    with cpu_profile(name, f"{self.dev.device}:COPY"): check(fn(self.dev.queue, ctypes.cast(mem, cl.cl_mem), True, 0, size, host, 0, None, None))
+    with cpu_profile(name, f"{self.dev.device}:COPY"):
+      target = ctypes.cast(mem, cl.cl_mem)
+      if mem in self.sub_buffers and not self.sub_buffers[mem]:
+        return check(fn(self.dev.queue, target, True, 0, size, host, 0, None, None))
+      # Host transfers through aliased cl_mem objects can miss cache invalidation on Adreno.
+      staging = self.alloc(size, BufferSpec())
+      try:
+        write = fn is cl.clEnqueueWriteBuffer
+        if write: check(fn(self.dev.queue, staging.meta, True, 0, size, host, 0, None, None))
+        src, dest = (staging.meta, target) if write else (target, staging.meta)
+        check(cl.clEnqueueCopyBuffer(self.dev.queue, src, dest, 0, 0, size, 0, None, None))
+        if write: check(cl.clFinish(self.dev.queue))
+        else: check(fn(self.dev.queue, staging.meta, True, 0, size, host, 0, None, None))
+      finally: self.free(staging, size, BufferSpec())
   def _copyin(self, dest:int, src:memoryview): self._copy(cl.clEnqueueWriteBuffer, f"TINY -> {self.dev.device}", dest, bytes(src), src.nbytes)
   def _copyout(self, dest:memoryview, src:int): self._copy(cl.clEnqueueReadBuffer, f"{self.dev.device} -> TINY", src, from_mv(dest), dest.nbytes)
 

@@ -35,6 +35,27 @@ class TestCLError(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "CL", "Runs only on OpenCL")
 class TestCLBufferView(unittest.TestCase):
+  def test_zero_offset_view_alias(self):
+    for lru in (0, 1):
+      with self.subTest(lru=lru), Context(LRU=lru):
+        base = Buffer("CL", 512).allocate()
+        view = base.view(256, 0).view(128, 0).ensure_allocated()
+        for value in range(16):
+          base.copy_from(Buffer("PYTHON", 512, initial_value=bytes([value])*512))
+          tensor = Tensor(UOp.from_buffer(view, dtypes.uint8))
+          tensor.assign(tensor + 1).realize()
+          self.assertEqual(bytes(base.as_memoryview()), bytes([value+1])*128 + bytes([value])*384)
+          self.assertEqual(bytes(view.as_memoryview()), bytes([value+1])*128)
+          parent = Tensor(UOp.from_buffer(base, dtypes.uint8))
+          parent.assign(parent + 1).realize()
+          view.copy_from(Buffer("PYTHON", 128, initial_value=bytes([9])*128))
+          self.assertEqual(bytes(base.as_memoryview()), bytes([9])*128 + bytes([value+1])*384)
+        view.deallocate()
+        base.deallocate()
+        base.allocate()
+        base.copy_from(Buffer("PYTHON", 512, initial_value=bytes([7])*512))
+        self.assertEqual(bytes(view.ensure_allocated().as_memoryview()), bytes([7])*128)
+
   def test_aligned_view_alias(self):
     alignment_bits = ctypes.c_uint32()
     self.assertEqual(cl.clGetDeviceInfo(Device["CL"].cl_dev, cl.CL_DEVICE_MEM_BASE_ADDR_ALIGN, 4, ctypes.byref(alignment_bits), None), 0)
@@ -48,12 +69,30 @@ class TestCLBufferView(unittest.TestCase):
         tensor = Tensor(UOp.from_buffer(view, dtypes.uint8))
         tensor.assign(tensor + 1).realize()
         self.assertEqual(bytes(base.as_memoryview()), bytes([3])*2*alignment + bytes([6])*alignment)
+        tensor.assign(tensor + 1).realize()
+        base.view(alignment, 0).ensure_allocated().copy_from(Buffer("PYTHON", alignment, initial_value=bytes([9])*alignment))
+        self.assertEqual(bytes(base.as_memoryview()), bytes([9])*alignment + bytes([3])*alignment + bytes([7])*alignment)
         view.deallocate()
-        self.assertEqual(bytes(base.view(alignment, 2*alignment).ensure_allocated().as_memoryview()), bytes([6])*alignment)
+        self.assertEqual(bytes(base.view(alignment, 2*alignment).ensure_allocated().as_memoryview()), bytes([7])*alignment)
         base.deallocate()
         base.allocate()
         base.copy_from(Buffer("PYTHON", 3*alignment, initial_value=bytes([7])*3*alignment))
         self.assertEqual(bytes(view.ensure_allocated().as_memoryview()), bytes([7])*alignment)
+
+  def test_overlapping_view_alias(self):
+    alignment_bits = ctypes.c_uint32()
+    self.assertEqual(cl.clGetDeviceInfo(Device["CL"].cl_dev, cl.CL_DEVICE_MEM_BASE_ADDR_ALIGN, 4, ctypes.byref(alignment_bits), None), 0)
+    alignment = max(1, alignment_bits.value // 8)
+    base = Buffer("CL", 4*alignment, initial_value=bytes(4*alignment))
+    first = base.view(2*alignment, alignment).ensure_allocated()
+    second = base.view(2*alignment, 2*alignment).ensure_allocated()
+    a, b = (Tensor(UOp.from_buffer(v, dtypes.uint8)) for v in (first, second))
+    a.assign(5).realize()
+    b.assign(b + 3).realize()
+    self.assertEqual(bytes(base.as_memoryview()), bytes(alignment) + bytes([5])*alignment + bytes([8])*alignment + bytes([3])*alignment)
+    first.copy_from(Buffer("PYTHON", 2*alignment, initial_value=bytes([9])*2*alignment))
+    self.assertEqual(bytes(base.as_memoryview()), bytes(alignment) + bytes([9])*2*alignment + bytes([3])*alignment)
+    self.assertEqual(bytes(second.as_memoryview()), bytes([9])*alignment + bytes([3])*alignment)
 
   def test_jit_out_of_band_reload(self):
     from examples.openpilot.helpers import dump_pickle, load_pickle

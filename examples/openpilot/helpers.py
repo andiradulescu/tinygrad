@@ -36,9 +36,14 @@ def dump_pickle(obj, path):
 def load_pickle(path, *, out_of_band=False):
   with open(path, "rb") as f:
     if not out_of_band: return pickle.load(f)
-    opcodes, buffers = f.read(struct.unpack('<q', f.read(8))[0]), Tensor(pathlib.Path(path))[f.tell():].to(Device.DEFAULT).realize().uop.buffer
+    opcodes, buffers = f.read(struct.unpack('<q', f.read(8))[0]), Tensor(pathlib.Path(path))[f.tell():]
 
-  def persistent_load(pid): return buffers.view(*pid)
+  if Device.DEFAULT != "CL": buffers = buffers.to(Device.DEFAULT).realize()
+
+  def persistent_load(pid):
+    size, offset = pid
+    if Device.DEFAULT == "CL": return buffers[offset:offset+size].to(Device.DEFAULT).realize().uop.buffer
+    return buffers.uop.buffer.view(size, offset)
 
   u = pickle.Unpickler(io.BytesIO(opcodes))
   u.persistent_load = persistent_load
