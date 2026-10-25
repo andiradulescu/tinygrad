@@ -72,7 +72,9 @@ class CLQueue(HWQueue):
 
   def encode(self) -> UOp:
     self.cmds:list[tuple] = []
-    return cl_run(encode_cmdbuf(self, self.lin), tuple(self.cmds))
+    buf = encode_cmdbuf(self, self.lin)
+    self.call(cl.clFlush, self.handle(1))
+    return cl_run(buf, tuple(self.cmds))
 
 Compiled.pm_encode += PatternMatcher([(UPat.sink(arg=KernelInfo("cl_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"),
                                        lambda s: CLQueue(s).encode())])

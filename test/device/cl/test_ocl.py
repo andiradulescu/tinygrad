@@ -1,4 +1,4 @@
-import ctypes, subprocess, sys, tempfile, unittest
+import ctypes, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from tinygrad import Device, Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer, BufferSpec
@@ -92,3 +92,25 @@ for value in (4, 5):
     self.assertEqual(bytes(view.as_memoryview()), bytes(range(8, 24)))
     view.host[:] = bytes([7])*16
     self.assertEqual(bytes(base.as_memoryview()), bytes(range(8)) + bytes([7])*16 + bytes(range(24, 32)))
+
+@unittest.skipUnless(Device.DEFAULT == "CL", "Runs only on OpenCL")
+class TestCLQueue(unittest.TestCase):
+  def test_progress_without_synchronize(self):
+    with Context(PROFILE=1, DEBUG=0, BEAM=0):
+      device = Device["CL"]
+      x = Tensor.ones(1024).contiguous().realize()
+      device.synchronize()
+      y = (x + 1).realize()
+      (buffer, _), entry = list(device.prof_ents.items())[-1]
+      event = ctypes.cast(buffer.host.view(fmt="Q")[entry.en_id - 1], cl.cl_event)
+      status = ctypes.c_int32()
+      deadline = time.monotonic() + device.wait_timeout_ms / 1000
+      try:
+        while True:
+          self.assertEqual(cl.clGetEventInfo(event, cl.CL_EVENT_COMMAND_EXECUTION_STATUS, 4, ctypes.byref(status), None), 0)
+          if status.value <= cl.CL_COMPLETE or time.monotonic() >= deadline: break
+          time.sleep(.001)
+        self.assertEqual(status.value, cl.CL_COMPLETE)
+      finally:
+        device.synchronize()
+      self.assertEqual(y.tolist(), [2.]*1024)
