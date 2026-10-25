@@ -64,6 +64,8 @@ class CLQueue(HWQueue):
       self.call(cl.clSetKernelArg, kernel, i, args[i].dtype.itemsize, (end - 8,))
     end = self.q64(*[g * l for g, l in zip(prg.arg.global_size, prg.arg.local_size)], *prg.arg.local_size) # [global][local]
     self.call(cl.clEnqueueNDRangeKernel, self.handle(1), kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0)
+    # Loading the queue from the command buffer orders each flush after its kernel.
+    self.cmds.append((cl.clFlush, self.q64(self.handle(1)) // 8 - 1))
     self.cmds += [(cl.clReleaseMemObject, w) for w in images]
 
   def wait(self, sig:UOp, val:UOp, eq=False): pass # the queue is in order
