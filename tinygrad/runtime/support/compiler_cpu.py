@@ -19,7 +19,8 @@ class ClangCompiler(Compiler):
     """Compile C source to ELF object file (before linking)."""
     # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
     return subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib',
-                                    '-fno-ident', f'--target={self.arch}-none-unknown-elf', *self.args, '-', '-o', '-'], input=src.encode('utf-8'))
+                                    '-fno-ident', '-Xclang', '-ffloat16-excess-precision=none',
+                                    f'--target={self.arch}-none-unknown-elf', *self.args, '-', '-o', '-'], input=src.encode('utf-8'))
 
   def disassemble(self, lib: bytes): cpu_objdump(lib)
 

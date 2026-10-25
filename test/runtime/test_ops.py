@@ -482,6 +482,12 @@ class TestOps(TensorTestCase):
     helper_test_op([], lambda: torch.tensor([5])+8, lambda: Tensor([5], dtype=dtypes.int64)+8, forward_only=True)
   def test_add3(self):
     helper_test_op([(45,65), (45,65), (45,65)], lambda x,y,z: x+y+z)
+  @unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "requires half support")
+  def test_add3_half_rounding(self):
+    x,y,z = [Tensor(v, dtype=dtypes.half).realize() for v in ([2048., 1.], [1., 0.00048828125], [-2048., -1.])]
+    out = (x+y+z).realize()
+    if not COMPILE_ONLY: np.testing.assert_array_equal(out.numpy(), [0., 0.])
+
   def test_broadcasted_add(self):
     helper_test_op([(45,65), (45,1)], lambda x,y: x+y)
     helper_test_op([(45,65), ()], lambda x,y: x+y)
