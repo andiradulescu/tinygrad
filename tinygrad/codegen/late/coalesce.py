@@ -94,6 +94,12 @@ def transform_to_image(ctx, buf:UOp, x:UOp) -> UOp|None:
   else:
     return buf.index(cidx.src[1], cidx.src[0])
 
+def load_image(ctx, buf:UOp, x:UOp, ld:UOp) -> UOp|None:
+  if (idx:=transform_to_image(ctx, buf, x)) is None: return None
+  loaded = idx.load(arg=ld.arg)
+  # Image reads are float4. Preserve half loads with scalar casts after devectorization.
+  return UOp.stack(*[loaded.index(i).cast(buf.dtype) for i in range(4)]) if buf.dtype is dtypes.half else loaded
+
 def store_image(x:UOp, d:UOp) -> UOp:
   # image load/store is always float, a half image converts on store
   def as_float(s:UOp):
@@ -102,7 +108,14 @@ def store_image(x:UOp, d:UOp) -> UOp:
   return x.store(UOp.stack(*[as_float(s) for s in lanes]))
 
 pm_simplify_add_image = PatternMatcher([
-  (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))), transform_to_image),
+  (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))).load(name="ld"),
+   load_image),
+  (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))).store(UPat(name="d")),
+   lambda ctx,buf,x,d: idx.store(d) if (idx:=transform_to_image(ctx, buf, x)) is not None else None),
+  # A float image read from half storage is already exactly representable in half.
+  (UPat(Ops.INDEX, src=(UPat(Ops.LOAD, dtype=dtypes.float, src=(UPat(Ops.INDEX,
+    src=(UPat(Ops.PARAM, dtype=dtypes.half, name="buf"), UPat(), UPat())),)), UPat()), name="x").cast(dtypes.half).cast(dtypes.float),
+   lambda x,buf: x if is_image_shape(buf._shape) else None),
   (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), store_image),
 ])
 

@@ -1082,6 +1082,38 @@ class TestOps(TensorTestCase):
   def test_gelu(self):
     helper_test_op([(45,65)], lambda x: torch.nn.functional.gelu(x, approximate="tanh"), lambda x: Tensor.gelu(x, approximate="tanh"))
     helper_test_op([(45,65)], lambda x: torch.nn.functional.gelu(x, approximate="none"), lambda x: Tensor.gelu(x, approximate="none"))
+  @unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "requires half support")
+  def test_half_image_gelu(self):
+    with Context(IMAGE=1):
+      x = Tensor.ones(16, 16, 4, dtype=dtypes.half).contiguous().realize()
+      out = x.gelu(approximate="none").realize()
+      self.assertEqual(out.dtype, dtypes.half)
+      if not COMPILE_ONLY: np.testing.assert_array_equal(out.numpy(), np.full((16, 16, 4), 0.8413447460685429, dtype=np.float16))
+
+  @unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "requires half support")
+  def test_image_half_roundtrip(self):
+    for image in (0, 1):
+      for dtype in (dtypes.half, dtypes.float):
+        with self.subTest(image=image, dtype=dtype), Context(IMAGE=image):
+          x = Tensor.full((16, 16, 4), 1.0007, dtype=dtype).contiguous().realize()
+          out = x.half().float().realize()
+          self.assertEqual(out.dtype, dtypes.float)
+          if not COMPILE_ONLY: np.testing.assert_array_equal(out.numpy(), np.full((16, 16, 4), 1.0009765625, dtype=np.float32))
+
+  @unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "requires half support")
+  def test_depthwise_conv_image_materialization(self):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((1, 128, 16, 32)).astype(np.float16)
+    w0,w1,b0,b1 = [(rng.standard_normal(s)*0.1).astype(np.float16) for s in ((128,1,3,3), (128,1,7,7), (128,), (128,))]
+    results = []
+    with Context(IMAGE=1, FLOAT16=1):
+      for materialize in (False, True):
+        y = Tensor(x).realize().conv2d(Tensor(w0), Tensor(b0), groups=128, padding=1).half()
+        if materialize: y.realize()
+        out = y.conv2d(Tensor(w1), Tensor(b1), groups=128, padding=3).half().realize()
+        if not COMPILE_ONLY: results.append(out.numpy())
+    if not COMPILE_ONLY: np.testing.assert_array_equal(*results)
+
   def test_gelu_extreme(self):
     helper_test_op([(45,65)], lambda x: torch.nn.functional.gelu(x, approximate="tanh"), lambda x: Tensor.gelu(x, approximate="tanh"),
                    low=300, high=400)
