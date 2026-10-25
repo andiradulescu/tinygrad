@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, hashlib, functools
 from tinygrad.runtime.autogen import opencl as cl, libc
 from tinygrad.runtime.support import c
-from tinygrad.helpers import to_char_p_p, from_mv, cpu_profile, OSX, DEBUG, suppress_finalizing, unwrap, round_up, is_image_shape, to_name
+from tinygrad.helpers import to_char_p_p, from_mv, cpu_profile, OSX, DEBUG, getenv, suppress_finalizing, unwrap, round_up, is_image_shape, to_name
 from tinygrad.renderer.cstyle import OpenCLRenderer
 from tinygrad.device import Buffer, HCQ_RUNTIME_DEV, BufferStorage, BufferSpec, HostAllocator, Compiled, Compiler, CompileError, MMIOInterface
 from tinygrad.dtype import dtypes
@@ -65,7 +65,7 @@ class CLQueue(HWQueue):
     end = self.q64(*[g * l for g, l in zip(prg.arg.global_size, prg.arg.local_size)], *prg.arg.local_size) # [global][local]
     self.call(cl.clEnqueueNDRangeKernel, self.handle(1), kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0)
     # Loading the queue from the command buffer orders each flush after its kernel.
-    self.cmds.append((cl.clFlush, self.q64(self.handle(1)) // 8 - 1))
+    if getenv("CL_FLUSH_PER_KERNEL"): self.cmds.append((cl.clFlush, self.q64(self.handle(1)) // 8 - 1))
     self.cmds += [(cl.clReleaseMemObject, w) for w in images]
 
   def wait(self, sig:UOp, val:UOp, eq=False): pass # the queue is in order
