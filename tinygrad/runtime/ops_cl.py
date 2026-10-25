@@ -2,9 +2,9 @@ from __future__ import annotations
 import ctypes, hashlib, functools
 from tinygrad.runtime.autogen import opencl as cl, libc
 from tinygrad.runtime.support import c
-from tinygrad.helpers import to_char_p_p, from_mv, cpu_profile, OSX, DEBUG, suppress_finalizing, unwrap, round_up, is_image_shape
+from tinygrad.helpers import to_char_p_p, from_mv, cpu_profile, OSX, DEBUG, suppress_finalizing, unwrap, round_up, is_image_shape, to_name
 from tinygrad.renderer.cstyle import OpenCLRenderer
-from tinygrad.device import BufferStorage, BufferSpec, HostAllocator, Compiled, Compiler, CompileError, MMIOInterface
+from tinygrad.device import Buffer, HCQ_RUNTIME_DEV, BufferStorage, BufferSpec, HostAllocator, Compiled, Compiler, CompileError, MMIOInterface
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.engine.realize import get_call_kernel_args
@@ -47,6 +47,7 @@ def cl_run(buf:UOp, cmds:tuple) -> UOp: # one in-order queue, every call after t
 
 class CLQueue(HWQueue):
   dev:CLDevice
+  def handle(self, i:int) -> UOp: return UOp.alloc((2,), dtypes.uint64, 0, device=self.devs[0], name="handles").index(i).load()
   def q64(self, *vals) -> int: return self.q(*[UOp.const(v, dtypes.uint64) if isinstance(v, int) else v.cast(dtypes.uint64) for v in vals])
   def call(self, fn, *args): self.cmds.append((fn, *[UOp.const(a, dtypes.uint64) if isinstance(a, int) else a for a in args]))
 
@@ -57,17 +58,17 @@ class CLQueue(HWQueue):
       if is_image_shape(shape): # [format][desc][errcode]
         desc = (cl.CL_MEM_OBJECT_IMAGE2D, shape[1], shape[0], 0, 0, round_up(shape[1], 256 if OSX else 1) * 4 * dt.itemsize, 0, 0, args[i])
         end = self.q64(cl.CL_RGBA | {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dt.itemsize] << 32, *desc, 0)
-        self.call(cl.clCreateImage, self.dev.handles[0], cl.CL_MEM_READ_WRITE, (end - 88,), (end - 80,), 0, (end - 8,))
+        self.call(cl.clCreateImage, self.handle(0), cl.CL_MEM_READ_WRITE, (end - 88,), (end - 80,), 0, (end - 8,))
         images.append((end - 8) // 8)
       else: end = self.q64(args[i])
       self.call(cl.clSetKernelArg, kernel, i, args[i].dtype.itemsize, (end - 8,))
     end = self.q64(*[g * l for g, l in zip(prg.arg.global_size, prg.arg.local_size)], *prg.arg.local_size) # [global][local]
-    self.call(cl.clEnqueueNDRangeKernel, self.dev.handles[1], kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0)
+    self.call(cl.clEnqueueNDRangeKernel, self.handle(1), kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0)
     self.cmds += [(cl.clReleaseMemObject, w) for w in images]
 
   def wait(self, sig:UOp, val:UOp, eq=False): pass # the queue is in order
   def signal(self, sig:UOp, val:UOp): self.call(libc.memcpy, sig.getaddr(self.devs), (self.q64(val) - 8,), 8) # synchronize finishes the queue
-  def timestamp(self, sig:UOp): self.call(cl.clEnqueueMarkerWithWaitList, self.dev.handles[1], 0, 0, sig.getaddr(self.devs)) # [event][time]
+  def timestamp(self, sig:UOp): self.call(cl.clEnqueueMarkerWithWaitList, self.handle(1), 0, 0, sig.getaddr(self.devs)) # [event][time]
 
   def encode(self) -> UOp:
     self.cmds:list[tuple] = []
@@ -125,13 +126,13 @@ class CLDevice(Compiled):
     if DEBUG >= 1: print(f"CLDevice: opening {self.device_name} with version {self.driver_version}")
     self.context = checked(cl.clCreateContext, None, 1, self.cl_dev, CC_CB(), None)
     self.queue = checked(cl.clCreateCommandQueue, self.context, self.cl_dev, cl.CL_QUEUE_PROFILING_ENABLE)
-    self.handles = [int.from_bytes(bytes(h), "little") for h in (self.context, self.queue)]
 
     arch = ",".join(exts:=info(cl.clGetDeviceInfo, self.cl_dev, cl.CL_DEVICE_EXTENSIONS).split())
     if "cl_khr_image2d_from_buffer" in exts:
       check(cl.clGetDeviceInfo(self.cl_dev, cl.CL_DEVICE_IMAGE_PITCH_ALIGNMENT, 4, ctypes.byref(ipa := ctypes.c_uint32()), None))
       arch += f",IMAGE_PITCH_ALIGNMENT={ipa.value}"
     super().__init__(device, CLAllocator(self), [OpenCLRenderer], None, arch=arch)
+    Compiled.link_bufs[to_name(self.device, "handles")] = Buffer(HCQ_RUNTIME_DEV.device, 16, initial_value=bytes(self.context) + bytes(self.queue))
     Compiled.pm_link += PatternMatcher([(UPat(Ops.ALLOC, name="p").store(UPat(Ops.PROGRAM, name="prg")), lambda p, prg, d=self:
       p.store(UOp(Ops.BINARY, arg=d.function(prg.src[3].arg, prg.src[0].arg.function_name))) if p.device == d.device else None)])
 

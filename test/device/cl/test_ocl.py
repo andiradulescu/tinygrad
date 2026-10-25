@@ -1,4 +1,4 @@
-import ctypes, tempfile, unittest
+import ctypes, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from tinygrad import Device, Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer, BufferSpec
@@ -65,6 +65,14 @@ class TestCLBufferView(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmp:
       path = Path(tmp) / "jit.pkl"
       dump_pickle(run, path)
+      subprocess.run([sys.executable, "-c", """
+import sys
+from tinygrad import Tensor
+from examples.openpilot.helpers import load_pickle
+run = load_pickle(sys.argv[1], out_of_band=True)
+for value in (4, 5):
+  assert run(Tensor.full((64,), value).contiguous().realize()).tolist() == [2*value+1]*64
+""", str(path)], check=True, timeout=Device["CL"].wait_timeout_ms / 1000)
       loaded = load_pickle(path, out_of_band=True)
     for value in (4, 5):
       self.assertEqual(loaded(Tensor.full((64,), value).contiguous().realize()).tolist(), [2*value+1]*64)
