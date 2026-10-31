@@ -275,12 +275,19 @@ class TestMSMReplay(unittest.TestCase):
 
   def test_from_blob_requires_fd(self):
     from tinygrad import Tensor
+    from tinygrad.device import Buffer
+    self.dev.synchronize()
+    cached = Buffer('QCOM', 16, preallocate=True)
+    handle = cached.meta.handle
+    cached.deallocate()
+    cache = {key: list(values) for key, values in self.dev.allocator.cache.items()}
     for ptr in (0, 4096):
       with self.subTest(ptr=ptr):
         allocations = set(self.dev.iface.allocations)
-        with self.assertRaises(MemoryError) as caught:
+        with self.assertRaisesRegex(ValueError, 'MSM DRM'):
           Tensor.from_blob(ptr, (4,), dtype='uint8', device='QCOM')
-        self.assertRegex(str(caught.exception.__cause__), 'MSM DRM')
+        self.assertTrue(all(self.dev.allocator.cache[key] == values for key, values in cache.items()))
+        self.assertIn(handle, self.dev.iface.allocations)
         self.assertEqual(set(self.dev.iface.allocations), allocations)
     owned = Tensor.empty(4, dtype='uint8', device='QCOM').realize().uop.buffer.ensure_allocated()
     self.assertIsNone(owned.options.external_ptr)

@@ -90,7 +90,7 @@ class TestHCQ2Schedule(unittest.TestCase):
     data = bytes(range(16))
     src.host[:] = data
     if Device.DEFAULT == "QCOM" and type(Device.default.iface).__name__ == "MSMIface":
-      with self.assertRaisesRegex(RuntimeError, "MSM DRM.*external pointer"): src.get_buf(Device.DEFAULT)
+      with self.assertRaisesRegex(ValueError, "MSM DRM.*external pointer"): src.get_buf(Device.DEFAULT)
       dst = Buffer(Device.DEFAULT, len(data), preallocate=True)
       dst.copy_from(src)
       self.assertEqual(bytes(dst.as_memoryview()), data)

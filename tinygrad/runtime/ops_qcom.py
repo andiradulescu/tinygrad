@@ -60,6 +60,7 @@ def qcom_submit(req:UOp, ret:UOp, fd:UOp) -> UOp: # the kernel driver takes the 
 @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
 def _msm_submit(device_id:int, offset:int, size:int, count:int, refs:int) -> int:
   return cast(QCOMDevice, Device["QCOM" if device_id == 0 else f"QCOM:{device_id}"]).iface._submit(offset, size, count, refs)
+# CPUProgram links custom calls through DLL symbols; keep this MSM-only callback alive for linked submissions.
 setattr(libc.dll, "msm_submit", _msm_submit)
 
 @uopfunc
@@ -453,7 +454,7 @@ class MSMIface:
     self.allocations[gem.handle] = allocation
     return BufferStorage(iova, allocation, view)
 
-  def map(self, _ptr:int, _size:int) -> BufferStorage: raise RuntimeError("MSM DRM does not support external pointer mapping")
+  def map(self, _ptr:int, _size:int) -> BufferStorage: raise ValueError("MSM DRM does not support external pointer mapping")
 
   def free(self, mem:BufferStorage):
     if not isinstance(allocation:=mem.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
