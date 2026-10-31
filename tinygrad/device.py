@@ -166,6 +166,7 @@ class Buffer:
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
   def allocate(self, opaque=None, external_ptr=None, external_fd=None, external_offset=0) -> Buffer:
     assert not self.is_allocated(), "can't allocate already allocated buffer"
+    if external_fd is not None and external_ptr is None: raise ValueError("external_fd requires external_ptr (use 0 for MSM DRM)")
     if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
     # MAX_BUFFER_SIZE limits raw storage bytes (not logical elements).
     if not self.device.startswith("NULL") and self.nbytes > MAX_BUFFER_SIZE > 0 and self.options.external_ptr is None:

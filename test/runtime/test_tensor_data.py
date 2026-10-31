@@ -16,6 +16,20 @@ class TestTensorBytes(unittest.TestCase):
     assert abs(lst.tolist()[1] - 0.8585) < 1e-6
 
 class TestTensorData(unittest.TestCase):
+  def test_from_blob_offset_requires_fd(self):
+    storage = (ctypes.c_ubyte * 4)(1, 2, 3, 4)
+    with self.assertRaisesRegex(ValueError, 'offset.*fd'):
+      Tensor.from_blob(ctypes.addressof(storage), (2,), offset=1, dtype='uint8', device='CPU')
+    self.assertEqual(Tensor.from_blob(ctypes.addressof(storage), (2,), dtype='uint8', device='CPU').tolist(), [1, 2])
+
+  def test_allocate_fd_requires_pointer(self):
+    from tinygrad.device import Buffer
+    with tempfile.TemporaryFile() as file:
+      buffer = Buffer('CPU', 4)
+      with self.assertRaisesRegex(ValueError, 'external_fd.*external_ptr'):
+        buffer.allocate(external_fd=file.fileno())
+      self.assertFalse(buffer.is_allocated())
+
   def test_from_blob_fd_borrows_cpu_mapping(self):
     from tinygrad import TinyJit
     with tempfile.TemporaryFile() as f:

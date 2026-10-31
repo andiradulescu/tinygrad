@@ -295,7 +295,7 @@ def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[Q
 class QCOMAllocator(Allocator['QCOMDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.external_fd is not None:
-      if not isinstance(self.dev.iface, MSMIface): raise RuntimeError("DMA-BUF import requires MSM DRM")
+      if not isinstance(self.dev.iface, MSMIface): raise ValueError("DMA-BUF import requires MSM DRM")
       return self.dev.iface.map(options.external_ptr or 0, size, options.external_fd, options.external_offset)
     if options.external_ptr is not None and (options.external_ptr or isinstance(self.dev.iface, MSMIface)):
       return self.dev.iface.map(options.external_ptr, size)
@@ -316,6 +316,7 @@ class QCOMAllocator(Allocator['QCOMDevice']):
   def _unmap(self, storage:BufferStorage): self.dev.iface.free(storage)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
+  # Only imported MSM storage lacks a host view; other QCOM storage copies through BufferStorage.host.
   def _copyin(self, dest:int, src:memoryview):
     self.dev.synchronize()
     iface = cast(MSMIface, self.dev.iface)

@@ -401,6 +401,13 @@ class TestMSMReplay(unittest.TestCase):
     self.enterContext(patch.object(type(Device), '__getitem__', lambda obj, key: self.dev if key == 'QCOM' else getitem(obj, key)))
     self.submit = self.enterContext(patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_SUBMIT', side_effect=self.record_submit))
 
+  def test_from_blob_fd_requires_msm(self):
+    from tinygrad import Tensor
+    from tinygrad.runtime.ops_qcom import KGSLIface
+    with tempfile.TemporaryFile() as file, patch.object(self.dev, 'iface', object.__new__(KGSLIface)):
+      with self.assertRaisesRegex(ValueError, 'DMA-BUF import requires MSM DRM'):
+        Tensor.from_blob(0, (4,), fd=file.fileno(), dtype='uint8', device='QCOM')
+
   def test_from_blob_requires_fd(self):
     from tinygrad import Tensor
     from tinygrad.device import Buffer

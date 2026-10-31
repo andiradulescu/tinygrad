@@ -391,11 +391,13 @@ class Tensor(RandMixin):
     For pointer-backed devices, the pointer must remain valid for the entire lifetime of the created Tensor.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
-    Pass a DMA-BUF `fd` and byte `offset` for devices that require them. The caller retains ownership of the fd.
+    Pass a DMA-BUF `fd` and byte `offset` for devices that require them. A nonzero `offset` requires `fd`.
+    The caller retains ownership of the fd.
     MSM DRM ignores `ptr` and duplicates `fd`, so the caller may close it after this call.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
     """
     if offset < 0: raise ValueError("DMA-BUF offset must be non-negative")
+    if fd is None and offset: raise ValueError("DMA-BUF offset requires an fd")
     r = Tensor.empty(*shape, **kwargs)
     assert isinstance(r.device, str)
     cast(Buffer, r.realize().uop.buffer).allocate(external_ptr=ptr, external_fd=fd, external_offset=offset)
