@@ -16,6 +16,19 @@ def _simple_test(add, extract=lambda x: x, N=10):
   assert_jit_cache_len(add, 1)
 
 class TestJit(unittest.TestCase):
+  def test_jit_realized_contiguous_input_view(self):
+    for offset in (0, 1, 8):
+      for reshape in (False, True):
+        with self.subTest(offset=offset, reshape=reshape):
+          values = [np.arange(274, dtype=np.float32) + i * 1000 for i in range(2)]
+          bases = [Tensor(v).realize() for v in values]
+          views = [b[offset:offset+257].contiguous().realize() for b in bases]
+          if reshape: views = [v.reshape(257, 1) for v in views]
+          f = TinyJit(lambda x: (x * 2 + 1).contiguous().realize())
+          for i in range(6):
+            expected = values[i % 2][offset:offset+257] * 2 + 1
+            np.testing.assert_array_equal(f(views[i % 2]).numpy(), expected.reshape(257, 1) if reshape else expected)
+
   def test_jit_input_view(self):
     @TinyJit
     def f(x): return (x[2:5].contiguous() + 1).realize()
