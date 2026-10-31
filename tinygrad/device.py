@@ -94,6 +94,8 @@ class BufferSpec:
   host: bool = False
   nolru: bool = False
   external_ptr: int|None = None
+  external_fd: int|None = None
+  external_offset: int = 0
 
 class MultiBuffer:
   def __init__(self, device:tuple[str, ...], nbytes:int):
@@ -162,13 +164,14 @@ class Buffer:
 
   def is_allocated(self) -> bool: return self._storage is not None and (self._base is None or self._base_storage is self.base._storage)
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
-  def allocate(self, opaque=None, external_ptr=None) -> Buffer:
+  def allocate(self, opaque=None, external_ptr=None, external_fd=None, external_offset=0) -> Buffer:
     assert not self.is_allocated(), "can't allocate already allocated buffer"
     if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
     # MAX_BUFFER_SIZE limits raw storage bytes (not logical elements).
     if not self.device.startswith("NULL") and self.nbytes > MAX_BUFFER_SIZE > 0 and self.options.external_ptr is None:
       raise RuntimeError(f"buffer of size {self.nbytes/1e6:.2f}MB is too large")
-    if external_ptr is not None: self.options = replace(self.options, external_ptr=external_ptr)
+    if external_ptr is not None:
+      self.options = replace(self.options, external_ptr=external_ptr, external_fd=external_fd, external_offset=external_offset)
     if self._base is not None:
       storage = replace(self.base.get_storage(), buf=self.allocator._offset(self.base._buf, self.nbytes, self.offset), maps={})
     elif opaque is not None:
@@ -202,15 +205,16 @@ class Buffer:
 
   def __reduce_ex__(self, protocol):
     buf:bytearray|pickle.PickleBuffer|None = None
+    options = self.options if self.options.external_fd is None else replace(self.options, external_ptr=None, external_fd=None, external_offset=0)
     if self._base is not None:
       return self.__class__, (self.device, self.nbytes, None, None, None, self.base, self.offset, self.is_allocated())
     if self.device == "NPY" and self.is_allocated():
       import numpy as np
       arr = np.frombuffer(self.meta, np.uint8, count=self.nbytes) # an out-of-band pickle buffer keeps the storage alive
-      return self.__class__, (self.device, self.nbytes, arr, self.options, None)
+      return self.__class__, (self.device, self.nbytes, arr, options, None)
     if self.is_allocated():
       buf = pickle.PickleBuffer(self.as_memoryview()) if protocol >= 5 else bytearray(self.as_memoryview())
-    return self.__class__, (self.device, self.nbytes, None, self.options, buf)
+    return self.__class__, (self.device, self.nbytes, None, options, buf)
 
   @property
   def trace_num(self) -> int:
@@ -269,7 +273,7 @@ class Allocator(Generic[DeviceType]):
 
   def free(self, storage:BufferStorage, size:int, options:BufferSpec|None=None):
     spec = options if options is not None else BufferSpec()
-    if not LRU or not self.lru or spec.nolru or spec.external_ptr is not None: return self.do_free(storage, spec)
+    if not LRU or not self.lru or spec.nolru or spec.external_ptr is not None or spec.external_fd is not None: return self.do_free(storage, spec)
 
     # add that buf to cache
     users:list[Compiled] = [self.dev, *storage.maps] if storage.host is not None else []

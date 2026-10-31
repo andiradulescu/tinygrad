@@ -69,7 +69,7 @@ tiny = Tensor.from_blob(rawbuf_ptr, (h*w*4,), dtype=dtypes.imagef((h,w)), device
 
 QCOM initialization tries KGSL first, then MSM DRM, unless the interface is selected with `DEV` (for example, `DEV=KGSL+QCOM` or `DEV=MSM+QCOM`). KGSL uses `/dev/kgsl-3d0`; its external-buffer path accepts the raw GPU pointers shown above.
 
-The MSM DRM path supports Adreno 630, searches `/dev/dri/renderD*` for the `msm` driver and uses the IR3 renderer. Raw external pointers cannot be mapped on MSM DRM; copy host data into a QCOM allocation instead.
+The MSM DRM path is for the supported A630 configuration. It searches `/dev/dri/renderD*` for a node whose DRM driver is `msm` and uses the IR3 renderer. MSM external buffers require a DMA-BUF file descriptor and a byte offset: use `Tensor.from_blob(0, shape, fd=dma_buf_fd, offset=byte_offset, dtype=..., device='QCOM')`. The pointer argument is ignored on MSM DRM; tinygrad derives the GPU address from the imported DMA-BUF plus `offset`. tinygrad duplicates `dma_buf_fd` during import, so the caller retains ownership of its original descriptor and may close it after `from_blob` returns. `offset` selects the byte range within that DMA-BUF. A raw pointer alone is not supported on MSM DRM.
 
 ## AMD Interfaces
 AMD backend supports several interfaces for communicating with devices:

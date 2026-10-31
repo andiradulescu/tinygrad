@@ -1,6 +1,6 @@
-import unittest, sys, ctypes, errno, mmap, struct
+import unittest, sys, ctypes, errno, mmap, struct, os, tempfile
 from unittest.mock import Mock, patch
-from tinygrad.runtime.autogen import msm_drm
+from tinygrad.runtime.autogen import msm_drm, dma_buf
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestQCOMCommands(unittest.TestCase):
@@ -125,6 +125,124 @@ class TestMSMDRMUAPI(unittest.TestCase):
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestMSMInterface(unittest.TestCase):
+  def test_imported_alias_lifetime_and_range(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+    from tinygrad.runtime.support.system import FileIOInterface
+    iface = object.__new__(MSMIface)
+    iface.fd, iface.allocations = Mock(), {}
+    iface.fd.munmap.side_effect = FileIOInterface.munmap
+    with tempfile.TemporaryFile() as file, patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=7)), \
+         patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', return_value=Mock(value=0x10000000)), \
+         patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close:
+      file.truncate(mmap.PAGESIZE)
+      file.write(bytes(range(32)))
+      file.flush()
+      borrowed = os.dup(file.fileno())
+      self.assertEqual(iface._allocation_index, [])
+      first, second = iface.map(0, 16, borrowed, 8), iface.map(0, 8, borrowed, 16)
+      self.assertIs(iface._allocation(second.buf, 8), first.meta)
+      os.close(borrowed)
+      retained = first.meta.dma_buf_fd
+      iface.free(first)
+      self.assertEqual(ctypes.string_at(second.meta.cpu_addr + 16, 8), bytes(range(16, 24)))
+      self.assertEqual(os.fstat(retained).st_size, mmap.PAGESIZE)
+      self.assertEqual(second.buf, 0x10000010)
+      close.assert_not_called()
+      with self.assertRaises(ValueError): iface.map(0, 16, file.fileno(), mmap.PAGESIZE - 8)
+      iface.free(second)
+      self.assertEqual(close.call_count, 1)
+      with self.assertRaises(OSError): os.fstat(retained)
+      self.assertFalse(iface.allocations)
+      with self.assertRaisesRegex(RuntimeError, "not allocated"): iface._allocation(second.buf, 8)
+
+  def test_fd_only_buffer_owns_import(self):
+    from tinygrad.device import BufferSpec
+    from tinygrad.runtime.ops_qcom import MSMIface, QCOMAllocator
+    from tinygrad.runtime.support.system import FileIOInterface
+    iface = object.__new__(MSMIface)
+    iface.fd, iface.allocations = Mock(), {}
+    iface.fd.munmap.side_effect = FileIOInterface.munmap
+    allocator = QCOMAllocator(Mock(iface=iface))
+    with tempfile.TemporaryFile() as file, patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=7)), \
+         patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', return_value=Mock(value=0x10000000)), \
+         patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close, patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC'):
+      file.truncate(mmap.PAGESIZE)
+      spec = BufferSpec(external_fd=file.fileno(), external_offset=8)
+      storage = allocator.alloc(16, spec)
+      retained = storage.meta.dma_buf_fd
+      allocator._copyin(storage.buf, memoryview(bytearray(b'borrowed storage')))
+      file.seek(8)
+      self.assertEqual(file.read(16), b'borrowed storage')
+      allocator.free(storage, 16, spec)
+      close.assert_called_once_with(iface.fd, handle=7)
+      self.assertFalse(any(allocator.cache.values()))
+      with self.assertRaises(OSError): os.fstat(retained)
+      self.assertEqual(os.fstat(file.fileno()).st_size, mmap.PAGESIZE)
+
+  def test_import_cleanup_on_partial_failure(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+    from tinygrad.runtime.support.system import FileIOInterface
+    for stage in ('dup', 'info', 'mmap'):
+      with self.subTest(stage=stage), tempfile.TemporaryFile() as file:
+        file.truncate(mmap.PAGESIZE)
+        retained = None if stage == 'dup' else os.dup(file.fileno())
+        iface = object.__new__(MSMIface)
+        iface.fd, iface.allocations = Mock(), {}
+        info = Mock(return_value=Mock(value=0x10000000))
+        if stage == 'info': info.side_effect = OSError(errno.EIO, stage)
+        try:
+          with patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=7)), \
+               patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close, \
+               patch.object(os, 'dup', side_effect=OSError(errno.EIO, stage) if stage == 'dup' else lambda _: retained), \
+               patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', info), \
+               patch.object(FileIOInterface, '_mmap', side_effect=OSError(errno.EIO, stage) if stage == 'mmap' else Mock()):
+            with self.assertRaises(OSError) as caught: iface.map(0, 16, file.fileno())
+          self.assertEqual((caught.exception.errno, caught.exception.strerror), (errno.EIO, stage))
+          close.assert_called_once_with(iface.fd, handle=7)
+          self.assertFalse(iface.allocations)
+          if retained is not None:
+            with self.assertRaises(OSError): os.fstat(retained)
+        finally:
+          if retained is not None:
+            try: os.close(retained)
+            except OSError: pass
+
+  def test_dma_buf_cpu_copy_retries_and_finalizes(self):
+    from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface, QCOMAllocator
+    data = (ctypes.c_ubyte * mmap.PAGESIZE)()
+    allocation = MSMAllocation(7, 0x10000000, mmap.PAGESIZE, mmap.PAGESIZE, ctypes.addressof(data), 3)
+    iface = object.__new__(MSMIface)
+    iface.allocations = {allocation.handle: allocation}
+    allocator = object.__new__(QCOMAllocator)
+    allocator.dev = Mock(iface=iface)
+    source, result = bytearray(b'copy bytes'), bytearray(len(b'copy bytes'))
+    for copy, args, flags in ((allocator._copyin, (allocation.iova + 8, memoryview(source)), dma_buf.DMA_BUF_SYNC_WRITE),
+                              (allocator._copyout, (memoryview(result), allocation.iova + 8), dma_buf.DMA_BUF_SYNC_READ)):
+      with self.subTest(flags=flags), patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC', side_effect=[OSError(errno.EINTR, 'start'), None,
+                                                                                                  OSError(errno.EAGAIN, 'end'), None]) as sync:
+        copy(*args)
+        self.assertEqual([call.kwargs['flags'] for call in sync.call_args_list],
+                         [flags, flags, flags | dma_buf.DMA_BUF_SYNC_END, flags | dma_buf.DMA_BUF_SYNC_END])
+    self.assertEqual(result, source)
+    blocked = bytearray(b'not copied')
+    with patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC', side_effect=[OSError(errno.EIO, 'start')]) as sync:
+      with self.assertRaises(OSError) as caught: allocator._copyin(allocation.iova + 32, memoryview(blocked))
+      self.assertEqual((caught.exception.errno, caught.exception.strerror), (errno.EIO, 'start'))
+      self.assertEqual(ctypes.string_at(allocation.cpu_addr + 32, len(blocked)), bytes(len(blocked)))
+      self.assertEqual(sync.call_count, 1)
+    written = bytearray(b'end error')
+    with patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC', side_effect=[None, OSError(errno.EIO, 'end')]) as sync:
+      with self.assertRaises(OSError) as caught: allocator._copyin(allocation.iova + 64, memoryview(written))
+      self.assertEqual((caught.exception.errno, caught.exception.strerror), (errno.EIO, 'end'))
+      self.assertEqual(ctypes.string_at(allocation.cpu_addr + 64, len(written)), written)
+      self.assertEqual(sync.call_count, 2)
+    with patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC', side_effect=[None, OSError(errno.EINTR, 'end'), None]) as sync:
+      with self.assertRaisesRegex(OSError, 'body'):
+        with iface.cpu_access(allocation, dma_buf.DMA_BUF_SYNC_WRITE): raise OSError('body')
+      self.assertEqual([call.kwargs['flags'] for call in sync.call_args_list], [dma_buf.DMA_BUF_SYNC_WRITE,
+                                                                                   dma_buf.DMA_BUF_SYNC_WRITE | dma_buf.DMA_BUF_SYNC_END,
+                                                                                   dma_buf.DMA_BUF_SYNC_WRITE | dma_buf.DMA_BUF_SYNC_END])
+
   def test_discovery_and_selection(self):
     from tinygrad import Context
     from tinygrad.runtime.ops_qcom import QCOMDevice, MSMIface

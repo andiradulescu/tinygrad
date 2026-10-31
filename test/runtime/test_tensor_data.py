@@ -1,4 +1,4 @@
-import unittest, struct
+import unittest, struct, mmap, os, ctypes, tempfile, pickle
 from tinygrad import Tensor, dtypes
 from tinygrad.uop.ops import UOp
 
@@ -16,6 +16,23 @@ class TestTensorBytes(unittest.TestCase):
     assert abs(lst.tolist()[1] - 0.8585) < 1e-6
 
 class TestTensorData(unittest.TestCase):
+  def test_from_blob_fd_borrows_cpu_mapping(self):
+    from tinygrad import TinyJit
+    with tempfile.TemporaryFile() as f:
+      f.truncate(mmap.PAGESIZE)
+      with mmap.mmap(f.fileno(), mmap.PAGESIZE) as mem:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(mem))
+        x = Tensor.from_blob(address + 17, (4,), fd=f.fileno(), offset=17, dtype='uint8', device='CPU')
+        run = TinyJit(lambda a: (a + 1).realize())
+        for value in (16, 64, 128, 235):
+          mem[17:21] = bytes([value]) * 4
+          self.assertEqual(run(x).tolist(), [value + 1] * 4)
+        snapshot = pickle.loads(pickle.dumps(x))
+        mem[17:21] = bytes([0]) * 4
+        self.assertEqual(snapshot.tolist(), [235] * 4)
+        del run, x, snapshot
+        self.assertGreaterEqual(os.fstat(f.fileno()).st_size, mmap.PAGESIZE)
+
   def test_data(self):
     a = Tensor([1,2,3,4], dtype=dtypes.int32)
     dat = a.data()
