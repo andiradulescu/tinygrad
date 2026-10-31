@@ -1,6 +1,8 @@
-import pickle, subprocess, sys, tempfile, unittest
+import ctypes, pickle, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from tinygrad import Device, Tensor, TinyJit
+from tinygrad.helpers import Context
+from tinygrad.runtime.autogen import opencl as cl
 from tinygrad.device import Buffer
 from tinygrad.runtime.ops_cl import CLDevice, CLAllocator
 
@@ -53,3 +55,25 @@ for value in (4, 5):
       loaded = pickle.loads(path.read_bytes())
     for value in (4, 5):
       self.assertEqual(loaded(Tensor.full((64,), value).contiguous().realize()).tolist(), [2*value+1]*64)
+
+@unittest.skipUnless(Device.DEFAULT == "CL", "Runs only on OpenCL")
+class TestCLQueue(unittest.TestCase):
+  def test_progress_without_synchronize(self):
+    with Context(PROFILE=1, DEBUG=0, BEAM=0):
+      device = Device["CL"]
+      x = Tensor.ones(1024).contiguous().realize()
+      device.synchronize()
+      y = (x + 1).realize()
+      (buffer, _), entry = list(device.prof_ents.items())[-1]
+      event = ctypes.cast(buffer.host.view(fmt="Q")[entry.en_id - 1], cl.cl_event)
+      status = ctypes.c_int32()
+      deadline = time.monotonic() + device.wait_timeout_ms / 1000
+      try:
+        while True:
+          self.assertEqual(cl.clGetEventInfo(event, cl.CL_EVENT_COMMAND_EXECUTION_STATUS, 4, ctypes.byref(status), None), 0)
+          if status.value <= cl.CL_COMPLETE or time.monotonic() >= deadline: break
+          time.sleep(.001)
+        self.assertEqual(status.value, cl.CL_COMPLETE)
+      finally:
+        device.synchronize()
+      self.assertEqual(y.tolist(), [2.]*1024)
