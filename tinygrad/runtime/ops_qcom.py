@@ -293,7 +293,9 @@ def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[Q
 
 class QCOMAllocator(Allocator['QCOMDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    return self.dev.iface.map(options.external_ptr, size) if options.external_ptr else self.dev.iface.alloc(size)
+    if options.external_ptr is not None and (options.external_ptr or isinstance(self.dev.iface, MSMIface)):
+      return self.dev.iface.map(options.external_ptr, size)
+    return self.dev.iface.alloc(size)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()

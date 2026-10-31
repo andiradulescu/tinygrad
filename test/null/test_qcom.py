@@ -273,6 +273,19 @@ class TestMSMReplay(unittest.TestCase):
     self.enterContext(patch.object(type(Device), '__getitem__', lambda obj, key: self.dev if key == 'QCOM' else getitem(obj, key)))
     self.submit = self.enterContext(patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_SUBMIT', side_effect=self.record_submit))
 
+  def test_from_blob_requires_fd(self):
+    from tinygrad import Tensor
+    for ptr in (0, 4096):
+      with self.subTest(ptr=ptr):
+        allocations = set(self.dev.iface.allocations)
+        with self.assertRaises(MemoryError) as caught:
+          Tensor.from_blob(ptr, (4,), dtype='uint8', device='QCOM')
+        self.assertRegex(str(caught.exception.__cause__), 'MSM DRM')
+        self.assertEqual(set(self.dev.iface.allocations), allocations)
+    owned = Tensor.empty(4, dtype='uint8', device='QCOM').realize().uop.buffer.ensure_allocated()
+    self.assertIsNone(owned.options.external_ptr)
+    self.assertIn(owned.meta.handle, self.dev.iface.allocations)
+
   def record_submit(self, _fd, **kwargs):
     req = kwargs['__payload']
     bos = (msm_drm.struct_drm_msm_gem_submit_bo * req.nr_bos).from_address(req.bos)
