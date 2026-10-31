@@ -109,6 +109,11 @@ class _TinyJit(Generic[ReturnType]):
 
   def add_linear(self, linear:UOp): self._linears.append(linear)
 
+  def prepare(self):
+    """Link a captured JIT for inputs without aliases, without executing it. Aliased inputs are prepared on invocation."""
+    if self.captured is None: raise JitError("cannot prepare an uncaptured JIT")
+    if () not in self.captured._linears: self.captured._linears[()] = (link_linear(self.captured._linear), {})
+
   def reset(self):
     assert self.fxn is not None, "can't reset without function"
     self.cnt = 0
