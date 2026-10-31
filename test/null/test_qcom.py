@@ -203,6 +203,16 @@ class TestMSMInterface(unittest.TestCase):
       iface.wait_signal([1], 1)
       wait.assert_not_called()
 
+  def test_allocation_lookup_boundaries(self):
+    from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
+    iface = object.__new__(MSMIface)
+    iface.allocations = {9: MSMAllocation(9, 0x2000, 64, 4096, 0), 7: MSMAllocation(7, 0x1000, 32, 4096, 0)}
+    for address, size, handle in ((0x1000, 32, 7), (0x1004, 8, 7), (0x101f, 1, 7), (0x2000, 64, 9), (0x203f, 1, 9)):
+      with self.subTest(address=address, size=size): self.assertEqual(iface._allocation(address, size).handle, handle)
+    for address, size in ((0xfff, 1), (0x101f, 2), (0x1020, 1), (0x1800, 4), (0x2040, 1)):
+      with self.subTest(address=address, size=size), self.assertRaisesRegex(RuntimeError, 'not allocated'):
+        iface._allocation(address, size)
+
   def test_allocation_and_submit(self):
     from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
     memory = [(ctypes.c_ubyte * mmap.PAGESIZE)() for _ in range(3)]
