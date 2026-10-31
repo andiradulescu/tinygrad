@@ -83,13 +83,34 @@ Compiled.pm_encode += PatternMatcher([(UPat.sink(arg=KernelInfo("cl_compute_subm
 # device
 
 class CLAllocator(HostAllocator):
+  def __init__(self, dev:CLDevice):
+    super().__init__(dev)
+    self.sub_buffers:dict[int, dict[tuple[int, int], cl.cl_mem]] = {}
+    alignment = ctypes.c_uint32()
+    check(cl.clGetDeviceInfo(dev.cl_dev, cl.CL_DEVICE_MEM_BASE_ADDR_ALIGN, 4, ctypes.byref(alignment), None))
+    self.alignment = max(1, alignment.value // 8)
+
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.host or options.cpu_access: return super()._alloc(size, options)
-    return BufferStorage(int.from_bytes(bytes(mem:=checked(cl.clCreateBuffer, self.dev.context, cl.CL_MEM_READ_WRITE, size, None)), "little"), mem)
+    mem = checked(cl.clCreateBuffer, self.dev.context, cl.CL_MEM_READ_WRITE, size, None)
+    self.sub_buffers[addr:=int.from_bytes(bytes(mem), "little")] = {}
+    return BufferStorage(addr, mem)
 
   @suppress_finalizing
   def _free(self, storage:BufferStorage, options:BufferSpec):
-    if storage.host is None: check(cl.clReleaseMemObject(storage.meta))
+    if storage.host is not None: return super()._free(storage, options)
+    for buf in self.sub_buffers.pop(storage.buf).values(): check(cl.clReleaseMemObject(buf))
+    check(cl.clReleaseMemObject(storage.meta))
+
+  def _offset(self, buf:int, size:int, offset:int) -> int:
+    if buf not in self.sub_buffers: return super()._offset(buf, size, offset)
+    if offset == 0: return buf
+    if offset % self.alignment: check(cl.CL_MISALIGNED_SUB_BUFFER_OFFSET)
+    if (size, offset) not in (views:=self.sub_buffers[buf]):
+      region = cl.cl_buffer_region(origin=offset, size=size)
+      views[size, offset] = checked(cl.clCreateSubBuffer, ctypes.cast(buf, cl.cl_mem), cl.CL_MEM_READ_WRITE,
+                                   cl.CL_BUFFER_CREATE_TYPE_REGION, ctypes.byref(region))
+    return int.from_bytes(bytes(views[size, offset]), "little")
   def _copy(self, fn, name:str, mem:int, host, size:int): # blocking, so the host memory can go
     with cpu_profile(name, f"{self.dev.device}:COPY"): check(fn(self.dev.queue, ctypes.cast(mem, cl.cl_mem), True, 0, size, host, 0, None, None))
   def _copyin(self, dest:int, src:memoryview): self._copy(cl.clEnqueueWriteBuffer, f"TINY -> {self.dev.device}", dest, bytes(src), src.nbytes)
