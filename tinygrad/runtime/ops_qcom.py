@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, contextlib, glob, errno, time
+import os, ctypes, functools, mmap, struct, array, math, contextlib, glob, errno, time, bisect
 from dataclasses import dataclass
 from typing import Any, cast
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
@@ -452,6 +452,7 @@ class MSMIface:
       raise
     allocation = MSMAllocation(gem.handle, iova, size, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
+    self.__dict__.pop('_allocation_index', None)
     return BufferStorage(iova, allocation, view)
 
   def map(self, _ptr:int, _size:int) -> BufferStorage: raise ValueError("MSM DRM does not support external pointer mapping")
@@ -462,12 +463,16 @@ class MSMIface:
     self.fd.munmap(allocation.cpu_addr, allocation.mapped_size)
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.allocations.pop(allocation.handle)
+    self.__dict__.pop('_allocation_index', None)
+
+  @functools.cached_property
+  def _allocation_index(self) -> list[MSMAllocation]: return sorted(self.allocations.values(), key=lambda a: a.iova)
 
   def _allocation(self, address:int, size:int) -> MSMAllocation:
-    matches = [allocation for allocation in self.allocations.values()
-               if allocation.iova <= address and address + size <= allocation.iova + allocation.size]
-    if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
-    return matches[0]
+    allocations = self._allocation_index
+    index = bisect.bisect_right(allocations, address, key=lambda a: a.iova) - 1
+    if index >= 0 and address + size <= (allocation:=allocations[index]).iova + allocation.size: return allocation
+    raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
 
   def prepare_submit(self, command:int, size:int, buffers:list[tuple[int, int]]):
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
