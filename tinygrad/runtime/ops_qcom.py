@@ -487,9 +487,9 @@ class MSMIface:
     referenced.pop(allocation.handle, None)
     allocations = [allocation, *[referenced[handle] for handle in sorted(referenced)]]
     read_write = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
-    bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(allocations))(*[
-      msm_drm.struct_drm_msm_gem_submit_bo(flags=command_flags if i == 0 else read_write, handle=mem.handle, presumed=mem.iova)
-      for i,mem in enumerate(allocations)])
+    bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(allocations))()
+    for i,(bo,mem) in enumerate(zip(bos, allocations)):
+      bo.flags, bo.handle, bo.presumed = command_flags if i == 0 else read_write, mem.handle, mem.iova
     cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(msm_drm.struct_drm_msm_gem_submit_cmd(
       type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
     submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=len(bos), nr_cmds=1,
