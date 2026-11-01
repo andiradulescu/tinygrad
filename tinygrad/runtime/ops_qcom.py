@@ -6,7 +6,7 @@ from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device,
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.system import FileIOInterface, System
-from tinygrad.runtime.autogen import kgsl, mesa, libc, msm_drm
+from tinygrad.runtime.autogen import kgsl, mesa, libc, msm_drm, dma_buf
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape, next_power2, flatten, to_name, PROFILE, IMAGE
@@ -294,18 +294,42 @@ def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[Q
 
 class QCOMAllocator(Allocator['QCOMDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    if options.external_fd is not None:
+      if not isinstance(self.dev.iface, MSMIface): raise ValueError("DMA-BUF import requires MSM DRM")
+      return self.dev.iface.map(options.external_ptr or 0, size, options.external_fd, options.external_offset)
     if options.external_ptr is not None and (options.external_ptr or isinstance(self.dev.iface, MSMIface)):
       return self.dev.iface.map(options.external_ptr, size)
     return self.dev.iface.alloc(size)
+
+  def do_free(self, storage:BufferStorage, options:BufferSpec):
+    super().do_free(storage, options)
+    if options.external_fd is not None and options.external_ptr is not None: self._free(storage, options)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
     self.dev.iface.free(storage)
   def _map(self, buf:Buffer) -> BufferStorage:
     if buf.device.split(":")[0] not in {"CPU", "PYTHON", "NPY"}: raise RuntimeError(f"Cannot map {buf.device} on {self.dev.device}")
+    if buf.options.external_fd is not None and isinstance(self.dev.iface, MSMIface):
+      return self.dev.iface.map(buf._buf, buf.nbytes, buf.options.external_fd, buf.options.external_offset)
     return self.dev.iface.map(buf._buf, buf.nbytes)
   def _unmap(self, storage:BufferStorage): self.dev.iface.free(storage)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
+
+  # Only imported MSM storage lacks a host view; other QCOM storage copies through BufferStorage.host.
+  def _copyin(self, dest:int, src:memoryview):
+    self.dev.synchronize()
+    iface = cast(MSMIface, self.dev.iface)
+    allocation = iface._allocation(dest, src.nbytes)
+    with iface.cpu_access(allocation, dma_buf.DMA_BUF_SYNC_WRITE):
+      ctypes.memmove(allocation.cpu_addr + dest - allocation.iova, mv_address(src), src.nbytes)
+
+  def _copyout(self, dest:memoryview, src:int):
+    self.dev.synchronize()
+    iface = cast(MSMIface, self.dev.iface)
+    allocation = iface._allocation(src, dest.nbytes)
+    with iface.cpu_access(allocation, dma_buf.DMA_BUF_SYNC_READ):
+      ctypes.memmove(mv_address(dest), allocation.cpu_addr + src - allocation.iova, dest.nbytes)
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
 
@@ -396,6 +420,8 @@ class MSMAllocation:
   size: int
   mapped_size: int
   cpu_addr: int
+  dma_buf_fd: int|None = None
+  references: int = 1
 
 def _open_msm_render_node(path:str) -> tuple[FileIOInterface, int]|None: # a dropped FileIOInterface closes its fd
   fd = FileIOInterface(path, os.O_RDWR)
@@ -455,15 +481,57 @@ class MSMIface:
     self.__dict__.pop('_allocation_index', None)
     return BufferStorage(iova, allocation, view)
 
-  def map(self, _ptr:int, _size:int) -> BufferStorage: raise ValueError("MSM DRM does not support external pointer mapping")
+  def map(self, ptr:int, size:int, fd:int|None=None, offset:int=0) -> BufferStorage:
+    if fd is None: raise ValueError("MSM DRM external pointers require a DMA-BUF fd")
+    if size <= 0 or offset < 0: raise ValueError("DMA-BUF size must be positive and offset non-negative")
+    length = os.lseek(fd, 0, os.SEEK_END)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if offset + size > length: raise ValueError(f"DMA-BUF range [{offset}, {offset + size}) exceeds DMA-BUF size {length}")
+    handle = msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE(self.fd, fd=fd).handle
+    allocation = self.allocations.get(handle)
+    if allocation is None:
+      retained_fd = None
+      try:
+        retained_fd = os.dup(fd)
+        iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA).value
+        cpu_addr = FileIOInterface._mmap(0, length, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, retained_fd, 0)
+      except Exception:
+        try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=handle)
+        finally:
+          if retained_fd is not None: os.close(retained_fd)
+        raise
+      allocation = self.allocations[handle] = MSMAllocation(handle, iova, length, length, cpu_addr, retained_fd)
+      self.__dict__.pop('_allocation_index', None)
+    else:
+      if allocation.dma_buf_fd is None: allocation.dma_buf_fd = os.dup(fd)
+      allocation.references += 1
+    return BufferStorage(allocation.iova + offset, allocation)
+
+  @contextlib.contextmanager
+  def cpu_access(self, allocation:MSMAllocation, flags:int):
+    def sync(flags):
+      if allocation.dma_buf_fd is None: return
+      while True:
+        try:
+          dma_buf.DMA_BUF_IOCTL_SYNC(allocation.dma_buf_fd, flags=flags)
+          return
+        except OSError as e:
+          if e.errno not in (errno.EAGAIN, errno.EINTR): raise
+    sync(flags)
+    try: yield
+    finally: sync(flags | dma_buf.DMA_BUF_SYNC_END)
 
   def free(self, mem:BufferStorage):
     if not isinstance(allocation:=mem.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
     if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
+    if allocation.references > 1:
+      allocation.references -= 1
+      return
     self.fd.munmap(allocation.cpu_addr, allocation.mapped_size)
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.allocations.pop(allocation.handle)
     self.__dict__.pop('_allocation_index', None)
+    if allocation.dma_buf_fd is not None: os.close(allocation.dma_buf_fd)
 
   @functools.cached_property
   def _allocation_index(self) -> list[MSMAllocation]: return sorted(self.allocations.values(), key=lambda a: a.iova)
