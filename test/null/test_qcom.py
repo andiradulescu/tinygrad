@@ -19,6 +19,32 @@ class TestQCOMCommands(unittest.TestCase):
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestKGSLInterface(unittest.TestCase):
+  def test_buffer_host_mapping_lifetime(self):
+    from tinygrad import Device
+    from tinygrad.device import Buffer, BufferSpec
+    from tinygrad.runtime.ops_qcom import KGSLIface, QCOMAllocator
+    from tinygrad.runtime.autogen import kgsl
+    iface = object.__new__(KGSLIface)
+    iface.fd = Mock()
+    dev = Mock(device="QCOM", iface=iface)
+    dev.allocator = QCOMAllocator(dev)
+    getitem = type(Device).__getitem__
+    src = Buffer("CPU", 16, options=BufferSpec(nolru=True), preallocate=True)
+    src.host[:] = data = bytes(range(16))
+    with patch.object(type(Device), '__getitem__', lambda obj, key: dev if key == 'QCOM' else getitem(obj, key)), \
+         patch('tinygrad.runtime.ops_qcom.dcache_flush', return_value=Mock()), \
+         patch.object(kgsl, 'IOCTL_KGSL_MAP_USER_MEM', return_value=Mock(gpuaddr=0x20000000)) as map_mem, \
+         patch.object(kgsl, 'IOCTL_KGSL_SHAREDMEM_FREE') as free:
+      first = src.get_buf('QCOM')
+      self.assertEqual(first, 0x20000000 + (src._buf & 0xfff))
+      self.assertEqual(src.get_buf('QCOM'), first)
+      self.assertEqual(map_mem.call_count, 1)
+      self.assertEqual(bytes(src.as_memoryview()), data)
+      src.deallocate()
+      free.assert_called_once_with(iface.fd, gpuaddr=0x20000000)
+      with self.assertRaisesRegex(RuntimeError, 'Cannot map NULL'):
+        dev.allocator.map(Buffer('NULL', 16, preallocate=True))
+
   def test_mapping_lifetime_and_errors(self):
     from tinygrad.runtime.ops_qcom import KGSLIface
     from tinygrad.runtime.autogen import kgsl
