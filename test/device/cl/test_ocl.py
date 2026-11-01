@@ -1,5 +1,6 @@
-import unittest
-from tinygrad import Device
+import pickle, subprocess, sys, tempfile, unittest
+from pathlib import Path
+from tinygrad import Device, Tensor, TinyJit
 from tinygrad.device import Buffer
 from tinygrad.runtime.ops_cl import CLDevice, CLAllocator
 
@@ -27,3 +28,28 @@ class TestCLError(unittest.TestCase):
     result = memoryview(bytearray(len(data) - 1))
     result[:] = buffer.as_memoryview()
     assert unaligned == result, "Unaligned data copied in must be equal to data copied out."
+
+
+@unittest.skipUnless(Device.DEFAULT == "CL", "Runs only on OpenCL")
+class TestCLJit(unittest.TestCase):
+  def test_jit_reload(self):
+    weights = Tensor.full((64,), 2).contiguous().realize()
+    @TinyJit
+    def run(x): return (x * weights + 1).realize()
+    for value in (1, 2, 3):
+      self.assertEqual(run(Tensor.full((64,), value).contiguous().realize()).tolist(), [2*value+1]*64)
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "jit.pkl"
+      path.write_bytes(pickle.dumps(run))
+      subprocess.run([sys.executable, "-c", """
+import sys
+from tinygrad import Tensor
+import pickle
+from pathlib import Path
+run = pickle.loads(Path(sys.argv[1]).read_bytes())
+for value in (4, 5):
+  assert run(Tensor.full((64,), value).contiguous().realize()).tolist() == [2*value+1]*64
+""", str(path)], check=True, timeout=Device["CL"].wait_timeout_ms / 1000)
+      loaded = pickle.loads(path.read_bytes())
+    for value in (4, 5):
+      self.assertEqual(loaded(Tensor.full((64,), value).contiguous().realize()).tolist(), [2*value+1]*64)
