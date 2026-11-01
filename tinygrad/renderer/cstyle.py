@@ -368,6 +368,9 @@ class MetalRenderer(CStyleLanguage):
     super().__init__(target)
     from tinygrad.runtime.ops_metal import MetalCompiler
     self.compiler, self.tensor_cores = MetalCompiler(), tc.metal if target.arch.startswith("Apple") and int(target.arch[5:]) >= 7 else []
+    if target.arch == "Apple10":
+      from tinygrad.renderer.metal import pm_tensorops
+      self.program_matcher = pm_tensorops
 
   # language options
   kernel_typedef = "kernel void"
