@@ -76,6 +76,7 @@ class Renderer:
   shared_max: int = 32768
   tensor_cores: list[TensorCore] = []
   extra_matcher: PatternMatcher|None = None
+  program_matcher: PatternMatcher|None = None
   packed_args: bool = False
   code_for_op: dict[Ops, Callable] = {}
 

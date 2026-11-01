@@ -487,6 +487,7 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """
   if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
   ast = graph_rewrite(ast, pm_lower_calls, ctx=LowerCallsCtx(renderer), name="lower calls", walk=True)
+  if renderer.program_matcher is not None and (prg := renderer.program_matcher.rewrite(ast, ctx=renderer)) is not None: ast = prg
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
