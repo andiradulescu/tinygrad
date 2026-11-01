@@ -1,7 +1,7 @@
 import unittest, gc, struct, ctypes, threading, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, uopfunc
@@ -13,11 +13,27 @@ from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache
 from test.null.test_hcq2 import compiled_chain, lower_hcq
+from test.helpers import call_is_hcq
 
 def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.alloc((size,), dtype, device="CPU", **kwargs)
 
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS) and not Device.DEFAULT.startswith("NULL"), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):
+  def test_profile_timestamps(self):
+    x, f = Tensor.full((4,), 2).contiguous().realize(), TinyJit(lambda a: (a + 1).realize())
+    before = len(Compiled.profile_events)
+    with Context(PROFILE=1):
+      for _ in range(5): np.testing.assert_array_equal(f(x).numpy(), [3] * 4)
+      Device[Device.DEFAULT].synchronize()
+    self.assertTrue(any(call_is_hcq(c) for c in f.captured._linear.src))
+    events = [e for e in Compiled.profile_events[before:] if isinstance(e, ProfileGraphEvent)]
+    times = [(e.sigs[x.st_id], e.sigs[x.en_id]) for e in events for x in e.ents]
+    self.assertTrue(times)
+    for st, en in times:
+      self.assertGreater(st, 0)
+      self.assertGreaterEqual(en, st)
+    self.assertTrue(any(en > st for st, en in times))
+
   def test_compile_and_link_are_idempotent(self):
     for jit in (False, True):
       with self.subTest(jit=jit):
