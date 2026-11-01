@@ -1,14 +1,16 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, contextlib
-from typing import Any
+import os, ctypes, functools, mmap, struct, array, math, contextlib, glob, errno, time
+from dataclasses import dataclass
+from typing import Any, cast
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.system import FileIOInterface, System
-from tinygrad.runtime.autogen import kgsl, mesa, libc
+from tinygrad.runtime.autogen import kgsl, mesa, libc, msm_drm
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape, next_power2, flatten, to_name, PROFILE, IMAGE
+from tinygrad.helpers import dedup, to_tuple
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.engine.realize import get_call_kernel_args
@@ -54,6 +56,17 @@ def qcom_submit(req:UOp, ret:UOp, fd:UOp) -> UOp: # the kernel driver takes the 
   idir, base, nr, struct_t = kgsl.IOCTL_KGSL_GPU_COMMAND.args
   ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
   return ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.index(0))).sink()
+
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
+def _msm_submit(device_id:int, offset:int, size:int, count:int, refs:int) -> int:
+  return cast(QCOMDevice, Device["QCOM" if device_id == 0 else f"QCOM:{device_id}"]).iface._submit(offset, size, count, refs)
+# CPUProgram links custom calls through DLL symbols; keep this MSM-only callback alive for linked submissions.
+setattr(libc.dll, "msm_submit", _msm_submit)
+
+@uopfunc
+def msm_submit_call(refs:UOp, ret:UOp, device_id:UOp, offset:UOp, size:UOp, count:UOp) -> UOp:
+  call = UOp.custom_function("msm_submit", dtype=dtypes.int32).call(device_id, offset, size, count, refs.index(0))
+  return ret.index(0).store(call).sink()
 
 class QCOMComputeQueue(HWQueue):
   dev:QCOMDevice
@@ -281,7 +294,9 @@ def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[Q
 
 class QCOMAllocator(Allocator['QCOMDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    return self.dev.iface.map(options.external_ptr, size) if options.external_ptr else self.dev.iface.alloc(size)
+    if options.external_ptr is not None and (options.external_ptr or isinstance(self.dev.iface, MSMIface)):
+      return self.dev.iface.map(options.external_ptr, size)
+    return self.dev.iface.alloc(size)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
@@ -369,11 +384,167 @@ class KGSLIface:
       with contextlib.suppress(OSError, RuntimeError):
         kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, timestamp=ts, timeout=int(timeout or self.dev.wait_timeout_ms))
 
+  def on_device_hang(self): pass
+
   def profile_finalize(self):
     with contextlib.suppress(RuntimeError): System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", "10", "Failed to reenable suspend mode")
 
+@dataclass
+class MSMAllocation:
+  handle: int
+  iova: int
+  size: int
+  mapped_size: int
+  cpu_addr: int
+
+def _open_msm_render_node(path:str) -> tuple[FileIOInterface, int]|None: # a dropped FileIOInterface closes its fd
+  fd = FileIOInterface(path, os.O_RDWR)
+  name = (ctypes.c_ubyte * msm_drm.DRM_CLIENT_NAME_MAX_LEN)()
+  version = msm_drm.DRM_IOCTL_VERSION(fd, name_len=len(name), name=name)
+  if bytes(name[:version.name_len]) != b"msm": return None
+  return fd, msm_drm.DRM_IOCTL_MSM_GET_PARAM(fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID).value
+
+class MSMIface:
+  count = 1
+  renderers = [IR3Renderer]
+
+  def __init__(self, dev:QCOMDevice, device_id:int):
+    if device_id != 0: raise RuntimeError(f"QCOM:{device_id} does not exist (1 MSM DRM device available)")
+    self.dev, last_error = dev, None
+    for path in sorted(glob.glob("/dev/dri/renderD*")):
+      try: node = _open_msm_render_node(path)
+      except OSError as e:
+        last_error = e
+        continue
+      if node is None: continue
+      fd, chip_id = node
+      gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
+      if gpu_id != (6, 3, 0): continue
+      self.fd, self.gpu_id = fd, gpu_id
+      break
+    else:
+      if last_error is not None: raise RuntimeError("Failed to open MSM DRM render node") from last_error
+      raise RuntimeError("No A630 MSM DRM render node found")
+
+    self.allocations:dict[int, MSMAllocation] = {}
+    self.fault_count = self._fault_count()
+    self.last_fence = 0
+    self.submit_error:Exception|None = None
+    self.var_vals = {"msm_device_id": device_id}
+
+  def _fault_count(self) -> int:
+    return msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_FAULTS).value
+
+  def alloc(self, size:int, fill_zeroes=False) -> BufferStorage:
+    if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
+    mapped_size = round_up(size, mmap.PAGESIZE)
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
+    cpu_addr = 0
+    try:
+      iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA).value
+      offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
+      cpu_addr = self.fd.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset)
+      view = MMIOInterface(cpu_addr, size, fmt='B')
+      if fill_zeroes: ctypes.memset(cpu_addr, 0, size)
+    except Exception:
+      if cpu_addr: self.fd.munmap(cpu_addr, mapped_size)
+      with contextlib.suppress(OSError): msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=gem.handle)
+      raise
+    allocation = MSMAllocation(gem.handle, iova, size, mapped_size, cpu_addr)
+    self.allocations[gem.handle] = allocation
+    return BufferStorage(iova, allocation, view)
+
+  def map(self, _ptr:int, _size:int) -> BufferStorage: raise ValueError("MSM DRM does not support external pointer mapping")
+
+  def free(self, mem:BufferStorage):
+    if not isinstance(allocation:=mem.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    if self.allocations.get(allocation.handle) is not allocation: raise RuntimeError(f"MSM GEM handle {allocation.handle} is already freed")
+    self.fd.munmap(allocation.cpu_addr, allocation.mapped_size)
+    msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
+    self.allocations.pop(allocation.handle)
+
+  def _allocation(self, address:int, size:int) -> MSMAllocation:
+    matches = [allocation for allocation in self.allocations.values()
+               if allocation.iova <= address and address + size <= allocation.iova + allocation.size]
+    if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+    return matches[0]
+
+  def prepare_submit(self, command:int, size:int, buffers:list[tuple[int, int]]):
+    if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
+    allocation = self._allocation(command, size)
+    command_offset = command - allocation.iova
+    if command_offset % 4: raise ValueError(f"MSM command offset must be a multiple of 4, got {command_offset}")
+    if command_offset < 0 or command_offset + size > allocation.size:
+      raise ValueError("MSM command range is outside its buffer")
+
+    referenced = {allocation.handle:allocation for allocation in (self._allocation(addr, size) for addr, size in buffers)}
+    command_flags = msm_drm.MSM_SUBMIT_BO_READ | (msm_drm.MSM_SUBMIT_BO_WRITE if allocation.handle in referenced else 0)
+    referenced.pop(allocation.handle, None)
+    allocations = [allocation, *[referenced[handle] for handle in sorted(referenced)]]
+    read_write = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+    bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(allocations))(*[
+      msm_drm.struct_drm_msm_gem_submit_bo(flags=command_flags if i == 0 else read_write, handle=mem.handle, presumed=mem.iova)
+      for i,mem in enumerate(allocations)])
+    cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)(msm_drm.struct_drm_msm_gem_submit_cmd(
+      type=msm_drm.MSM_SUBMIT_CMD_BUF, submit_idx=0, submit_offset=command_offset, size=size))
+    submit = msm_drm.struct_drm_msm_gem_submit(flags=msm_drm.MSM_PIPE_3D0, nr_bos=len(bos), nr_cmds=1,
+                                               bos=ctypes.addressof(bos), cmds=ctypes.addressof(cmds), queueid=0)
+    return submit, bos, cmds
+
+  def submit(self, hq:QCOMComputeQueue, cmdbuf:UOp) -> UOp:
+    # The same GETADDRs patch the commands and describe their BOs, including replacement inputs and views.
+    buffers = dedup([unwrap_view(cmdbuf)[0], *[unwrap_view(g.src[0])[0] for g in cmdbuf.toposort(enter_calls=True)
+                                              if g.op is Ops.GETADDR and to_tuple(g.arg) == hq.devs]])
+    refs = UOp.alloc((16 * len(buffers),), dtypes.uint8, device=HCQ_RUNTIME_DEV.device, name="msm_bos")
+    refs = patch(refs, [(i * 16 + off, val) for i, b in enumerate(buffers)
+                       for off, val in ((0, b.getaddr(hq.devs)), (8, UOp.const(b.nbytes(), dtypes.uint64)))])
+    return msm_submit_call(refs.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=hq.devs[0], name="submit_ret"),
+                           UOp.variable("msm_device_id", 0, 2**31 - 1, dtypes.int32),
+                           UOp.const(unwrap_view(cmdbuf)[1], dtypes.uint64), UOp.const(cmdbuf.max_numel(), dtypes.uint64),
+                           UOp.const(len(buffers), dtypes.uint64))
+
+  def _submit(self, offset:int, size:int, count:int, refs:int) -> int:
+    # Exceptions cannot cross a ctypes callback. Latch them, wait_signal raises them on the next wait.
+    if self.submit_error is not None: return -1
+    try:
+      words = (ctypes.c_uint64 * (count * 2)).from_address(refs)
+      prepared = self.prepare_submit(words[0] + offset, size, list(zip(words[::2], words[1::2])))
+      while True:
+        try:
+          msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
+          self.last_fence = prepared[0].fence
+          break
+        except OSError as e:
+          if e.errno not in (errno.EINTR, errno.EAGAIN): raise
+      return 0
+    except Exception as e:
+      self.submit_error = e
+      return -1
+
+  def wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
+    if self.submit_error is not None: raise self.submit_error
+    if sig[0] >= value: return
+    deadline = time.monotonic_ns() + int((timeout if timeout is not None else self.dev.wait_timeout_ms) * 1_000_000)
+    wait_until = msm_drm.struct_drm_msm_timespec(tv_sec=deadline // 1_000_000_000, tv_nsec=deadline % 1_000_000_000)
+    while True:
+      try:
+        msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=self.last_fence, queueid=0, timeout=wait_until)
+        return
+      except OSError as e:
+        if e.errno == errno.ETIMEDOUT: raise RuntimeError(f"{self.dev.device} signal wait timed out") from e
+        if e.errno not in (errno.EINTR, errno.EAGAIN): raise
+
+  def on_device_hang(self):
+    fault_count, previous_fault_count = self._fault_count(), self.fault_count
+    self.fault_count = fault_count
+    if fault_count > previous_fault_count:
+      self.submit_error = error = RuntimeError(f"MSM GPU faults increased from {previous_fault_count} to {fault_count}")
+      raise error
+
+  def profile_finalize(self): pass
+
 class QCOMDevice(Compiled):
-  ifaces = [KGSLIface]
+  ifaces = [KGSLIface, MSMIface]
   _stack:Buffer|None
   timestamp_divider = 19.2
 
@@ -398,6 +569,10 @@ class QCOMDevice(Compiled):
   def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
     self.iface.wait_signal(sig, value, timeout)
     super()._wait_signal(sig, value, timeout)
+
+  def on_device_hang(self):
+    self.iface.on_device_hang()
+    super().on_device_hang()
 
   def _ensure_stack_size(self, sz:int) -> Buffer: # one stack for the device, grown to the deepest program's private memory
     if self._stack is None or self._stack.nbytes < sz:
