@@ -1,4 +1,4 @@
-import ctypes, errno, mmap, os, pickle, tempfile, threading, unittest
+import ctypes, errno, mmap, os, pickle, struct, tempfile, threading, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from tinygrad import Device, Tensor
@@ -63,7 +63,7 @@ class TestMSMDmaBuf(unittest.TestCase):
     self.sync_flags, self.sync_errors = [], []
     self.enterContext(patch.object(fcntl, "ioctl", side_effect=self.sync))
     self.file = self.enterContext(tempfile.TemporaryFile())
-    self.file.write(bytes(range(32)))
+    self.file.write(bytes(range(128)))
     self.file.truncate(mmap.PAGESIZE + 32)
     self.file.flush()
 
@@ -79,12 +79,12 @@ class TestMSMDmaBuf(unittest.TestCase):
 
   def test_aliases_and_pickle_snapshot(self):
     borrowed = os.dup(self.file.fileno())
-    try: first, alias = self.blob(offset=7, fd=borrowed), self.blob(size=4, offset=10)
+    try: first, alias = self.blob(size=40, offset=32, fd=borrowed), self.blob(size=4, offset=64)
     finally: os.close(borrowed)
     self.assertEqual(len(self.drm.bindings), 1)
     self.assertEqual(list(self.drm.bindings.values()), [2*mmap.PAGESIZE])
     with self.assertRaises(OSError): os.fstat(self.drm.fences[0])
-    self.assertEqual(first.tolist(), list(range(7, 15)))
+    self.assertEqual(first.tolist(), list(range(32, 72)))
     buffers = []
     payload = pickle.dumps(alias, protocol=5, buffer_callback=buffers.append)
     retained = alias.uop.buffer.meta.fd
@@ -92,18 +92,18 @@ class TestMSMDmaBuf(unittest.TestCase):
     copied = alias.uop.buffer.as_memoryview(allow_zero_copy=True)
     view = alias.uop.buffer.view(2, 1).ensure_allocated()
     view.copy_from(Buffer("NPY", 2, initial_value=b"xy"))
-    self.assertEqual(alias.tolist(), [10, ord("x"), ord("y"), 13])
-    self.assertEqual(os.pread(self.file.fileno(), 4, 10), b"\x0axy\x0d")
-    self.assertEqual(bytes(copied), b"\x0a\x0b\x0c\x0d")
+    self.assertEqual(alias.tolist(), list(b"@xyC"))
+    self.assertEqual(os.pread(self.file.fileno(), 4, 64), b"@xyC")
+    self.assertEqual(bytes(copied), b"@ABC")
     alias.uop.buffer.deallocate()
     with self.assertRaises(OSError): os.fstat(retained)
     snap = pickle.loads(payload, buffers=buffers)
-    self.assertEqual(snap.tolist(), [10, 11, 12, 13])
+    self.assertEqual(snap.tolist(), list(b"@ABC"))
     snap.uop.buffer.deallocate()
     self.assertEqual((self.drm.handles, self.drm.bindings), ({}, {}))
 
   def test_range_and_bind_failure(self):
-    with self.assertRaisesRegex(ValueError, "exceeds DMA-BUF size"): self.blob(offset=mmap.PAGESIZE + 30)
+    with self.assertRaisesRegex(ValueError, "exceeds DMA-BUF size"): self.blob(offset=mmap.PAGESIZE + 32)
     with self.assertRaisesRegex(ValueError, "non-negative"): self.blob(offset=-1)
     with self.assertRaisesRegex(ValueError, "non-empty"): self.blob(size=0)
     with self.assertRaisesRegex(ValueError, "offset requires an fd"):
@@ -118,6 +118,18 @@ class TestMSMDmaBuf(unittest.TestCase):
         with self.assertRaises(OSError): os.fstat(self.drm.last_import)
         self.assertEqual((self.drm.handles, self.drm.bindings, self.iface.dmabufs), ({}, {}, {}))
         self.assertEqual(len(self.iface.va_allocator.blocks), 1)
+
+  def test_gpu_base_alignment(self):
+    for dtype, offset in (("float32", 1), ("float32", 4), ("uint8", 17)):
+      with self.subTest(dtype=dtype, offset=offset), self.assertRaisesRegex(ValueError, "aligned to 32 bytes"):
+        Tensor.from_blob(0, (4,), fd=self.file.fileno(), offset=offset, dtype=dtype, device="QCOM")
+    self.assertEqual(self.drm.handles, {})
+
+    values = (1.0, 3.0, 5.0, 7.0)
+    os.pwrite(self.file.fileno(), struct.pack("=4f", *values), 32)
+    aligned = Tensor.from_blob(0, (4,), fd=self.file.fileno(), offset=32, dtype="float32", device="QCOM")
+    self.assertEqual(aligned.tolist(), list(values))
+    aligned.uop.buffer.deallocate()
 
   def test_mmap_failure_keeps_caller_fd(self):
     with tempfile.NamedTemporaryFile() as backing:

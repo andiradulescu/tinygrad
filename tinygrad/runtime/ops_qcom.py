@@ -442,6 +442,8 @@ class MSMIface:
 
   def import_dmabuf(self, fd:int, size:int, offset:int) -> BufferStorage:
     if size <= 0: raise ValueError("DMA-BUF import requires a non-empty range")
+    # A6xx texture descriptors discard the low address bits. This also covers the global vector load/store widths.
+    if offset % (align:=1 << mesa.A6XX_TEX_CONST_4_BASE_LO__SHIFT): raise ValueError(f"DMA-BUF offset must be aligned to {align} bytes")
     with self._lock, contextlib.ExitStack() as cleanup:
       retained_fd = os.dup(fd)
       cleanup.callback(os.close, retained_fd)

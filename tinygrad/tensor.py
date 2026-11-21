@@ -474,7 +474,7 @@ class Tensor(RandMixin):
     Exposes external storage as a Tensor. A borrowed pointer must remain valid for the lifetime of the created Tensor.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
-    MSM DRM imports `fd` at byte `offset` and ignores `ptr`. The caller retains ownership of `fd`.
+    MSM DRM imports `fd` at a 32-byte aligned `offset` and ignores `ptr`. The caller retains ownership of `fd`.
     KGSL accepts a pointer without an fd. Non-QCOM devices use `ptr` as the start of the data and ignore `fd` and `offset`.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
     """
