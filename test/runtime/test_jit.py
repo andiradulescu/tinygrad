@@ -16,6 +16,35 @@ def _simple_test(add, extract=lambda x: x, N=10):
   assert_jit_cache_len(add, 1)
 
 class TestJit(unittest.TestCase):
+  def test_prepare_links_without_running(self):
+    import pickle
+    from unittest.mock import patch
+    from tinygrad.engine.jit import link_linear
+    f = TinyJit(lambda a: (a + 1).realize())
+    x = Tensor([1., 2., 3.]).realize()
+    for _ in range(3): f(x).numpy()
+    f = pickle.loads(pickle.dumps(f))
+    state = f.captured
+    count = f.cnt
+    output = state.ret.numpy().copy()
+    kernels = GlobalCounters.kernel_count
+    with patch('tinygrad.engine.jit.link_linear', wraps=link_linear) as link:
+      f.prepare()
+      f.prepare()
+      self.assertEqual(link.call_count, 1)
+      self.assertIs(f.captured, state)
+      self.assertEqual(f.cnt, count)
+      self.assertEqual(GlobalCounters.kernel_count, kernels)
+      np.testing.assert_array_equal(state.ret.numpy(), output)
+      for value in (10., 20.):
+        self.assertEqual(f(Tensor([value] * 3).realize()).tolist(), [value + 1] * 3)
+      self.assertEqual(link.call_count, 1)
+      self.assertEqual(f(f.captured.ret).tolist(), [22.] * 3)
+      self.assertEqual(link.call_count, 2)
+      self.assertEqual(f(f.captured.ret).tolist(), [23.] * 3)
+      self.assertEqual(link.call_count, 2)
+    with self.assertRaisesRegex(JitError, "cannot prepare an uncaptured JIT"): TinyJit(lambda a: a + 1).prepare()
+
   def test_jit_input_view(self):
     @TinyJit
     def f(x): return (x[2:5].contiguous() + 1).realize()
