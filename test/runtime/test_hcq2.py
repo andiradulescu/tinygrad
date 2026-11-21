@@ -1,7 +1,7 @@
 import unittest, gc, struct, ctypes, threading, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, uopfunc
@@ -18,6 +18,22 @@ def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.alloc((
 
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS) and not Device.DEFAULT.startswith("NULL"), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):
+  def test_profile_timestamps(self):
+    x, f = Tensor.full((4,), 2).contiguous().realize(), TinyJit(lambda a: (a + 1).realize())
+    with Context(PROFILE=1):
+      for _ in range(2): f(x)
+      Device.default.synchronize()
+      seen = len(Compiled.profile_events)
+      self.assertEqual(f(x).tolist(), [3] * 4)
+      Device.default.synchronize()
+    events = [e for e in Compiled.profile_events[seen:] if isinstance(e, ProfileGraphEvent)]
+    ranges = [(e.sigs[k.st_id], e.sigs[k.en_id]) for e in events for k in e.ents if k.device == Device.DEFAULT]
+    self.assertTrue(ranges)
+    for start, end in ranges:
+      self.assertGreater(start, 0)
+      self.assertGreaterEqual(end, start)
+    self.assertTrue(any(end > start for start, end in ranges))
+
   def test_compile_and_link_are_idempotent(self):
     for jit in (False, True):
       with self.subTest(jit=jit):
