@@ -37,7 +37,7 @@ x = (tiny_tensor1 + 1).realize()
 
 ### `QCOM` OpenCL Interoperability
 
-tinygrad supports OpenCL interoperability on `QCOM` backend.
+The KGSL interface supports OpenCL interoperability on the `QCOM` backend.
 
 Buffer interop allows direct access to OpenCL memory buffers:
 ```python
@@ -64,6 +64,13 @@ rawbuf_ptr = to_mv(cl_buf_desc_ptr, 0x100).cast('Q')[20] # offset 0xA0 is a raw 
 # create tiny tensor
 tiny = Tensor.from_blob(rawbuf_ptr, (h*w*4,), dtype=dtypes.imagef((h,w)), device='QCOM')
 ```
+
+### `QCOM` MSM DRM Interoperability
+
+With the MSM DRM interface (`DEV=MSM+QCOM:IR3`), import a DMA-BUF with `Tensor.from_blob(0, shape, fd=fd, offset=offset, dtype=dtype, device='QCOM')`.
+The GPU address comes from the DMA-BUF mapping and the byte offset. The caller retains ownership of the original fd and can close it after import.
+The DMA-BUF must support a shared read/write CPU mapping. CPU copies use DMA-BUF cache synchronization.
+The caller must wait for the external producer before submitting GPU work and keep the data available until GPU work completes.
 
 ## AMD Interfaces
 AMD backend supports several interfaces for communicating with devices:
