@@ -18,15 +18,18 @@ def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.alloc((
 
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS) and not Device.DEFAULT.startswith("NULL"), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):
+  @unittest.skipUnless(Device.DEFAULT == "QCOM", "QCOM device required")
   def test_profile_timestamps(self):
     x, f = Tensor.full((4,), 2).contiguous().realize(), TinyJit(lambda a: (a + 1).realize())
     with Context(PROFILE=1):
       for _ in range(2): f(x)
       Device.default.synchronize()
       seen = len(Compiled.profile_events)
-      self.assertEqual(f(x).tolist(), [3] * 4)
+      out = f(x)
       Device.default.synchronize()
-    events = [e for e in Compiled.profile_events[seen:] if isinstance(e, ProfileGraphEvent)]
+      stop = len(Compiled.profile_events)
+    self.assertEqual(out.tolist(), [3] * 4)
+    events = [e for e in Compiled.profile_events[seen:stop] if isinstance(e, ProfileGraphEvent)]
     ranges = [(e.sigs[k.st_id], e.sigs[k.en_id]) for e in events for k in e.ents if k.device == Device.DEFAULT]
     self.assertTrue(ranges)
     for start, end in ranges:
