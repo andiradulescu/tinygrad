@@ -1,11 +1,13 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, select, contextlib, time
+import os, ctypes, functools, mmap, struct, array, math, select, contextlib, time, errno, threading
+from dataclasses import dataclass
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator
 from tinygrad.renderer import TinyELF
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
 from tinygrad.runtime.support.memory import MMIOInterface, TLSFAllocator
 from tinygrad.runtime.support.system import FileIOInterface, System
+from tinygrad.runtime.support.c import _IOW
 from tinygrad.runtime.autogen import kgsl, msm_drm, mesa, libc
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
@@ -16,6 +18,10 @@ from tinygrad.engine.realize import get_call_kernel_args
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
+
+# include/uapi/linux/dma-buf.h: struct dma_buf_sync contains one __u64 flags field.
+DMA_BUF_IOCTL_SYNC = _IOW('b', 0, ctypes.c_uint64)
+DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE, DMA_BUF_SYNC_END = 1 << 0, 2 << 0, 1 << 2
 
 @functools.cache
 def dcache_flush():
@@ -283,13 +289,35 @@ def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[Q
   return data, patch(make_program(prg, len(image), devs[0]), [], image)
 
 class QCOMAllocator(Allocator['QCOMDevice']):
+  def import_dmabuf(self, buf:Buffer, fd:int, offset:int):
+    if not isinstance(iface:=self.dev.iface, MSMIface): raise ValueError("DMA-BUF import requires MSM DRM")
+    storage = iface.import_dmabuf(fd, buf.nbytes, offset)
+    try: buf.allocate(opaque=storage)
+    except BaseException:
+      iface.free(storage)
+      raise
+
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    return self.dev.iface.map(options.external_ptr, size) if options.external_ptr else self.dev.iface.alloc(size)
+    iface = self.dev.iface
+    if options.external_ptr is None: return iface.alloc(size)
+    if not isinstance(iface, KGSLIface): raise ValueError("MSM DRM external pointers require a DMA-BUF fd")
+    return iface.map(options.external_ptr, size) if options.external_ptr else iface.alloc(size)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
     self.dev.iface.free(storage)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
+
+  def _dmabuf_access(self, addr:int, size:int, flags:int):
+    if not isinstance(iface:=self.dev.iface, MSMIface): raise NotImplementedError("QCOM buffer has no host mapping")
+    self.dev.synchronize()
+    return iface.dmabuf_access(addr, size, flags)
+
+  def _copyin(self, dest:int, src:memoryview):
+    with self._dmabuf_access(dest, src.nbytes, DMA_BUF_SYNC_WRITE) as mv: mv[:] = src.cast('B')
+
+  def _copyout(self, dest:memoryview, src:int):
+    with self._dmabuf_access(src, dest.nbytes, DMA_BUF_SYNC_READ) as mv: dest.cast('B')[:] = mv
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
 
@@ -348,6 +376,15 @@ class KGSLIface:
     with contextlib.suppress(OSError, RuntimeError):
       kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, timestamp=ts, timeout=tm)
 
+@dataclass
+class MSMDmaBuf:
+  handle: int
+  addr: int
+  size: int
+  fd: int
+  mem: mmap.mmap
+  refs: int = 1
+
 class MSMIface:
   count, submit_ioctl = 1, msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT
 
@@ -361,28 +398,105 @@ class MSMIface:
     msm_drm.DRM_IOCTL_MSM_SET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_EN_VM_BIND, value=1)
     self.chip_id = self._param(msm_drm.MSM_PARAM_CHIP_ID) & 0xffffffff # the upper bits can carry the speedbin
     self.va_allocator = TLSFAllocator(self._param(msm_drm.MSM_PARAM_VA_SIZE), base=self._param(msm_drm.MSM_PARAM_VA_START))
+    self._lock, self.dmabufs = threading.RLock(), dict[int, MSMDmaBuf]()
     self.ctx, self.bind_queue = [msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=f).id for f in (0, msm_drm.MSM_SUBMITQUEUE_VM_BIND)]
 
   def _param(self, param:int) -> int: return msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=param).value
 
-  def alloc(self, size:int) -> BufferStorage:
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=round_up(size, 0x1000), flags=msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE)
-    va_addr = self.va_allocator.alloc(gem.size)
-    bind_op = msm_drm.struct_drm_msm_vm_bind_op(op=msm_drm.MSM_VM_BIND_OP_MAP, handle=gem.handle, iova=va_addr, range=gem.size)
-    bind = msm_drm.DRM_IOCTL_MSM_VM_BIND(self.fd, flags=msm_drm.MSM_VM_BIND_FENCE_FD_OUT, nr_ops=1, queue_id=self.bind_queue, op=bind_op)
-    select.select([bind.fence_fd], [], []) # binds are async and submits don't wait for them
-    os.close(bind.fence_fd)
+  def _bind(self, handle:int, size:int) -> int:
+    addr = self.va_allocator.alloc(size)
+    try:
+      op = msm_drm.struct_drm_msm_vm_bind_op(op=msm_drm.MSM_VM_BIND_OP_MAP, handle=handle, iova=addr, range=size)
+      fence = msm_drm.DRM_IOCTL_MSM_VM_BIND(self.fd, flags=msm_drm.MSM_VM_BIND_FENCE_FD_OUT, nr_ops=1, queue_id=self.bind_queue, op=op).fence_fd
+    except BaseException:
+      self.va_allocator.free(addr)
+      raise
+    try:
+      try:
+        poller = select.poll()
+        poller.register(fence, select.POLLIN) # binds are async and submits don't wait for them
+        if poller.poll()[0][1] != select.POLLIN: raise OSError(errno.EIO, "MSM VM_BIND fence did not signal")
+      finally: os.close(fence)
+    except BaseException:
+      self._unbind(addr, size)
+      raise
+    return addr
 
-    mmap_off = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
-    cpu_addr = self.fd.mmap(0, gem.size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mmap_off)
-    return BufferStorage(va_addr, gem, MMIOInterface(cpu_addr, size, fmt='B'))
+  def _unbind(self, addr:int, size:int):
+    op = msm_drm.struct_drm_msm_vm_bind_op(op=msm_drm.MSM_VM_BIND_OP_UNMAP, iova=addr, range=size)
+    msm_drm.DRM_IOCTL_MSM_VM_BIND(self.fd, nr_ops=1, queue_id=self.bind_queue, op=op) # a map of this VA waits for the unmap
+    self.va_allocator.free(addr)
+
+  def alloc(self, size:int) -> BufferStorage:
+    with self._lock, contextlib.ExitStack() as cleanup:
+      gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=round_up(size, 0x1000), flags=msm_drm.MSM_BO_WC | msm_drm.MSM_BO_NO_SHARE)
+      cleanup.callback(msm_drm.DRM_IOCTL_GEM_CLOSE, self.fd, handle=gem.handle)
+      addr = self._bind(gem.handle, gem.size)
+      cleanup.callback(self._unbind, addr, gem.size)
+      mmap_off = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
+      cpu_addr = self.fd.mmap(0, gem.size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mmap_off)
+      cleanup.callback(FileIOInterface.munmap, cpu_addr, gem.size)
+      storage = BufferStorage(addr, gem, MMIOInterface(cpu_addr, size, fmt='B'))
+      cleanup.pop_all()
+      return storage
+
+  def import_dmabuf(self, fd:int, size:int, offset:int) -> BufferStorage:
+    if size <= 0: raise ValueError("DMA-BUF import requires a non-empty range")
+    # A6xx texture descriptors discard the low address bits. This also covers the global vector load/store widths.
+    if offset % (align:=1 << mesa.A6XX_TEX_CONST_4_BASE_LO__SHIFT): raise ValueError(f"DMA-BUF offset must be aligned to {align} bytes")
+    with self._lock, contextlib.ExitStack() as cleanup:
+      retained_fd = os.dup(fd)
+      cleanup.callback(os.close, retained_fd)
+      length = os.lseek(retained_fd, 0, os.SEEK_END)
+      if not 0 <= offset <= length - size: raise ValueError(f"DMA-BUF range [{offset}, {offset + size}) exceeds DMA-BUF size {length}")
+      handle = msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE(self.fd, fd=retained_fd).handle
+      if (imported:=self.dmabufs.get(handle)) is not None:
+        imported.refs += 1
+      else:
+        cleanup.callback(msm_drm.DRM_IOCTL_GEM_CLOSE, self.fd, handle=handle)
+        mem = mmap.mmap(retained_fd, length, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        cleanup.callback(mem.close)
+        addr = self._bind(handle, mapped_size:=round_up(length, mmap.PAGESIZE))
+        cleanup.callback(self._unbind, addr, mapped_size)
+        imported = self.dmabufs[handle] = MSMDmaBuf(handle, addr, length, retained_fd, mem)
+        cleanup.pop_all()
+      return BufferStorage(imported.addr + offset, imported)
+
+  @contextlib.contextmanager
+  def dmabuf_access(self, addr:int, size:int, flags:int):
+    def sync(fd:int, flags:int):
+      while True:
+        try:
+          DMA_BUF_IOCTL_SYNC(fd, flags)
+          return
+        except OSError as e:
+          if e.errno not in (errno.EINTR, errno.EAGAIN): raise
+
+    with self._lock:
+      for imported in self.dmabufs.values():
+        if 0 <= (offset:=addr - imported.addr) and offset + size <= imported.size: break
+      else: raise ValueError(f"Address range {addr:#x}+{size} is outside imported DMA-BUF storage")
+      sync(imported.fd, flags)
+      try:
+        with memoryview(imported.mem)[offset:offset+size] as mv: yield mv
+      finally: sync(imported.fd, flags | DMA_BUF_SYNC_END)
 
   def free(self, storage:BufferStorage):
-    unmap_op = msm_drm.struct_drm_msm_vm_bind_op(op=msm_drm.MSM_VM_BIND_OP_UNMAP, iova=storage.buf, range=storage.meta.size)
-    msm_drm.DRM_IOCTL_MSM_VM_BIND(self.fd, nr_ops=1, queue_id=self.bind_queue, op=unmap_op) # binds run in order: a map of this va waits for it
-    self.va_allocator.free(storage.buf)
-    FileIOInterface.munmap(unwrap(storage.host).addr, storage.meta.size)
-    msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=storage.meta.handle)
+    with self._lock:
+      if isinstance(imported:=storage.meta, MSMDmaBuf):
+        if imported.refs > 1:
+          imported.refs -= 1
+          return
+        self._unbind(imported.addr, round_up(imported.size, mmap.PAGESIZE))
+        del self.dmabufs[imported.handle]
+        with contextlib.ExitStack() as cleanup:
+          cleanup.callback(msm_drm.DRM_IOCTL_GEM_CLOSE, self.fd, handle=imported.handle)
+          cleanup.callback(os.close, imported.fd)
+          imported.mem.close()
+      else:
+        self._unbind(storage.buf, storage.meta.size)
+        FileIOInterface.munmap(unwrap(storage.host).addr, storage.meta.size)
+        msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=storage.meta.handle)
 
   def submit_req(self, ib:UOp, size:int, ctx:UOp) -> UOp:
     cmd = cstruct(msm_drm.struct_drm_msm_gem_submit_cmd, type=msm_drm.MSM_SUBMIT_CMD_BUF, size=size, iova=ib)

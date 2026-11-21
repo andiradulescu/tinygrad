@@ -1,6 +1,6 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
 from __future__ import annotations
-import time, functools, sys, inspect, pathlib, hashlib, weakref
+import time, functools, sys, inspect, pathlib, hashlib, weakref, operator
 from dataclasses import dataclass, field, replace
 from typing import Callable, cast, get_args, ParamSpec, TypeVar, TYPE_CHECKING
 if TYPE_CHECKING: import numpy
@@ -469,17 +469,25 @@ class Tensor(RandMixin):
   # ***** creation entrypoint *****
 
   @staticmethod
-  def from_blob(ptr:int, shape:tuple[int, ...], **kwargs) -> Tensor:
+  def from_blob(ptr:int, shape:tuple[int, ...], fd:int|None=None, offset:int=0, **kwargs) -> Tensor:
     """
-    Exposes the pointer as a Tensor without taking ownership of the original data.
-    The pointer must remain valid for the entire lifetime of the created Tensor.
+    Exposes external storage as a Tensor. A borrowed pointer must remain valid for the lifetime of the created Tensor.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    MSM DRM imports `fd` at a 32-byte aligned `offset` and ignores `ptr`. The caller retains ownership of `fd`.
+    KGSL accepts a pointer without an fd. Non-QCOM devices use `ptr` as the start of the data and ignore `fd` and `offset`.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
     """
+    offset = operator.index(offset)
+    if offset < 0: raise ValueError("DMA-BUF offset must be non-negative")
+    if fd is None and offset: raise ValueError("DMA-BUF offset requires an fd")
     r = Tensor.empty(*shape, **kwargs)
     assert isinstance(r.device, str)
-    cast(Buffer, r.realize().uop.buffer).allocate(external_ptr=ptr)
+    buf = cast(Buffer, r.realize().uop.buffer)
+    if fd is not None and r.device.split(":")[0] == "QCOM":
+      from tinygrad.runtime.ops_qcom import QCOMAllocator
+      cast(QCOMAllocator, buf.allocator).import_dmabuf(buf, fd, offset)
+    else: buf.allocate(external_ptr=ptr)
     return r
 
   @staticmethod
