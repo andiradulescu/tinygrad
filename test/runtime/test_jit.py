@@ -16,6 +16,34 @@ def _simple_test(add, extract=lambda x: x, N=10):
   assert_jit_cache_len(add, 1)
 
 class TestJit(unittest.TestCase):
+  def test_jit_realized_contiguous_input_view(self):
+    for offset in (0, 1, 8):
+      for reshape in (False, True):
+        with self.subTest(offset=offset, reshape=reshape):
+          values = [np.arange(274, dtype=np.float32) + i * 1000 for i in range(2)]
+          bases = [Tensor(v).realize() for v in values]
+          views = [b[offset:offset+257].contiguous().realize() for b in bases]
+          if reshape: views = [v.reshape(257, 1) for v in views]
+          f = TinyJit(lambda x: (x * 2 + 1).contiguous().realize())
+          for i in range(6):
+            expected = values[i % 2][offset:offset+257] * 2 + 1
+            np.testing.assert_array_equal(f(views[i % 2]).numpy(), expected.reshape(257, 1) if reshape else expected)
+
+  def test_jit_multibuffer_view_input(self):
+    for lane_views in (False, True):
+      with self.subTest(lane_views=lane_views):
+        f = TinyJit(lambda x: (x + 1).realize())
+        inputs = []
+        for i in range(4):
+          # Keep lane view values fixed to isolate signature matching from replay buffer binding.
+          offset = 0 if lane_views else i*16
+          values = list(range(offset, offset+16))
+          a, b = [Tensor(values[j:j+8], device=d).realize().uop for j,d in ((0, "CPU"), (8, "CPU:1"))]
+          if lane_views: a, b = [u.reshape((2, 4)).reshape((8,)) for u in (a, b)]
+          inputs.append((Tensor(a.mstack(b)).reshape(2, 4), np.arange(offset+1, offset+17).reshape(4, 4)))
+        for x, expected in inputs:
+          np.testing.assert_array_equal(Tensor(f(x).uop.unshard(0)).to("CPU").numpy(), expected)
+
   def test_jit_input_view(self):
     @TinyJit
     def f(x): return (x[2:5].contiguous() + 1).realize()
