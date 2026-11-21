@@ -71,6 +71,7 @@ With the MSM DRM interface (`DEV=MSM+QCOM:IR3`), import a DMA-BUF with `Tensor.f
 The GPU address comes from the DMA-BUF mapping and the byte offset. The caller retains ownership of the original fd and can close it after import.
 The DMA-BUF must support a shared read/write CPU mapping. CPU copies use DMA-BUF cache synchronization.
 The caller must wait for the external producer before submitting GPU work and keep the data available until GPU work completes.
+Use views of one imported tensor for dependent accesses to overlapping bytes. With separate imports, the caller must order those accesses.
 
 ## AMD Interfaces
 AMD backend supports several interfaces for communicating with devices:
